@@ -1,23 +1,24 @@
 # Terraform Providers
 
-Monorepo for custom Terraform providers managed by [@tegar](https://github.com/tegar).
+Monorepo for custom Terraform providers.
+Repo: [github.com/TEGAR-SRC/terraform-providers](https://github.com/TEGAR-SRC/terraform-providers)
 
 ## Provider List
 
-| Provider | Status | Description |
-|----------|--------|-------------|
-| [`digitalocean`](./digitalocean) | Archived | Fork of official `terraform-provider-digitalocean` |
-| [`hetzner`](./hetzner) | Fork | Fork of official `terraform-provider-hetzner` |
-| [`hostinger`](./hostinger) | Internal | Hostinger / hPanel API provider |
-| [`ionoscloud`](./ionoscloud) | Fork | Fork of official `terraform-provider-ionoscloud` |
-| [`Juniper`](./Juniper) | Internal | Juniper network device provider |
-| [`mikrotik`](./mikrotik) | Internal | MikroTik RouterOS provider |
-| [`onidelcloud`](./onidelcloud) | **Active** | Onidel Cloud API provider — 10 resources + 13 data sources |
-| [`openstack`](./openstack) | Fork | Fork of official `terraform-provider-openstack` |
-| [`proxmox`](./proxmox) | Fork | Fork / custom Proxmox VE provider |
-| [`rustfs`](./rustfs) | Internal | RustFS / MinIO-compatible storage provider |
-| [`virtualizor`](./virtualizor) | Internal | Virtualizor VPS provider |
-| [`vmware`](./vmware) | Fork | Fork of official `terraform-provider-vmware` (vSphere) |
+| # | Provider | Versi | Status | Deskripsi |
+|---|----------|-------|--------|-----------|
+| 1 | [`digitalocean`](./digitalocean) | - | Archived | Fork dari official `terraform-provider-digitalocean`. Manage Droplets, spaces, volumes, DNS, dan resource DigitalOcean lainnya |
+| 2 | [`hetzner`](./hetzner) | - | Fork | Fork dari official `terraform-provider-hetzner`. Manage server cloud Hetzner, dedicated server, dan network |
+| 3 | [`hostinger`](./hostinger) | - | Internal | Provider untuk Hostinger / hPanel API. Manage hosting account, domain, email, dan VPS |
+| 4 | [`ionoscloud`](./ionoscloud) | - | Fork | Fork dari official `terraform-provider-ionoscloud`. Manage IONOS Cloud infrastructure, datacenter, server, storage |
+| 5 | [`Juniper`](./Juniper) | - | Internal | Provider untuk Juniper network devices. Manage konfigurasi switch, router, firewall Juniper via API |
+| 6 | [`mikrotik`](./mikrotik) | - | Internal | Provider untuk MikroTik RouterOS. Manage interface, firewall, DHCP, routing, dan konfigurasi RouterBoard |
+| 7 | [`onidelcloud`](./onidelcloud) | 0.1.0 | **Active** | Provider untuk Onidel Cloud API. 10 resource + 13 data sources: SSH Key, VPC, Firewall, VM, Object Storage, Reserved IP, IP List, Startup Script, Snapshot, Backup |
+| 8 | [`openstack`](./openstack) | - | Fork | Fork dari official `terraform-provider-openstack`. Manage OpenStack compute, network, storage, identity |
+| 9 | [`proxmox`](./proxmox) | - | Fork | Fork & custom Proxmox VE provider. Manage VM, container, storage, cluster Proxmox |
+| 10 | [`rustfs`](./rustfs) | - | Internal | Provider untuk RustFS / MinIO-compatible object storage. Manage bucket, policy, service account, quota, user |
+| 11 | [`virtualizor`](./virtualizor) | - | Internal | Provider untuk Virtualizor VPS. Manage virtual server, plan, ISO, dan resource Virtualizor |
+| 12 | [`vmware`](./vmware) | - | Fork | Fork dari official `terraform-provider-vmware` (vSphere). Manage VM, datastore, network, cluster vSphere |
 
 ## Repository Structure
 
@@ -59,9 +60,7 @@ terraform-providers/
 └── vmware/                # VMware vSphere provider
 ```
 
-### Onidel Cloud Provider
-
-**Resources (10):**
+### Onidel Cloud Provider — Resources
 
 | Resource | Endpoint | Description |
 |----------|----------|-------------|
@@ -76,7 +75,7 @@ terraform-providers/
 | `onidelcloud_reserved_ip` | `POST/GET/PATCH/DELETE /network/reserved_ips` | Reserved IP address |
 | `onidelcloud_startup_script` | `POST/GET/PUT/DELETE /startup_scripts` | Startup script |
 
-**Data Sources (13):**
+### Onidel Cloud Provider — Data Sources
 
 | Data Source | Endpoint | Description |
 |-------------|----------|-------------|
