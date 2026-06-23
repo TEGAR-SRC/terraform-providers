@@ -15,6 +15,7 @@ Monorepo for custom Terraform providers managed by [@tegar](https://github.com/t
 | [`onidelcloud`](./onidelcloud) | **Active** | Onidel Cloud API provider — 10 resources + 13 data sources |
 | [`openstack`](./openstack) | Fork | Fork of official `terraform-provider-openstack` |
 | [`proxmox`](./proxmox) | Fork | Fork / custom Proxmox VE provider |
+| [`rustfs`](./rustfs) | Internal | RustFS / MinIO-compatible storage provider |
 | [`virtualizor`](./virtualizor) | Internal | Virtualizor VPS provider |
 | [`vmware`](./vmware) | Fork | Fork of official `terraform-provider-vmware` (vSphere) |
 
@@ -53,6 +54,7 @@ terraform-providers/
 │       └── backup/           # data source
 ├── openstack/             # OpenStack provider
 ├── proxmox/               # Proxmox provider
+├── rustfs/                # RustFS / MinIO provider
 ├── virtualizor/           # Virtualizor provider
 └── vmware/                # VMware vSphere provider
 ```
