@@ -1,0 +1,4309 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package resource
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/helpers/ptr"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/containers"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/tasks"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/ssh"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/types"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/version"
+	"github.com/bpg/terraform-provider-proxmox/proxmoxtf"
+	sdkresource "github.com/bpg/terraform-provider-proxmox/proxmoxtf/resource"
+	"github.com/bpg/terraform-provider-proxmox/proxmoxtf/resource/validators"
+	vmresource "github.com/bpg/terraform-provider-proxmox/proxmoxtf/resource/vm"
+	"github.com/bpg/terraform-provider-proxmox/proxmoxtf/structure"
+	"github.com/bpg/terraform-provider-proxmox/utils"
+)
+
+const (
+	dvCloneDatastoreID                  = ""
+	dvCloneNodeName                     = ""
+	dvCloneFull                         = true
+	dvConsoleEnabled                    = true
+	dvConsoleMode                       = "tty"
+	dvConsoleTTYCount                   = 2
+	dvInitializationDNSDomain           = ""
+	dvInitializationDNSServer           = ""
+	dvInitializationIPConfigIPv4Address = ""
+	dvInitializationIPConfigIPv4Gateway = ""
+	dvInitializationIPConfigIPv6Address = ""
+	dvInitializationIPConfigIPv6Gateway = ""
+	dvInitializationHostname            = ""
+	dvInitializationUserAccountPassword = ""
+	dvInitializationEntrypoint          = ""
+	dvCPUArchitecture                   = "amd64"
+	dvCPUCores                          = 1
+	dvCPULimit                          = float64(0)
+	dvCPUUnits                          = 0
+	dvDescription                       = ""
+	dvDevicePassthroughMode             = "0660"
+	dvDiskACL                           = false
+	dvDiskDatastoreID                   = "local"
+	dvDiskQuota                         = false
+	dvDiskReplicate                     = false
+	dvDiskSize                          = 4
+	dvFeaturesNesting                   = false
+	dvFeaturesKeyControl                = false
+	dvFeaturesFUSE                      = false
+	dvFeaturesMakeDeviceNode            = false
+	dvHookScript                        = ""
+	dvMemoryDedicated                   = 512
+	dvMemorySwap                        = 0
+	dvMountPointACL                     = false
+	dvMountPointBackup                  = false
+	dvMountPointPath                    = ""
+	dvMountPointQuota                   = false
+	dvMountPointReadOnly                = false
+	dvMountPointReplicate               = true
+	dvMountPointShared                  = false
+	dvMountPointSize                    = ""
+	dvNetworkInterfaceBridge            = "vmbr0"
+	dvNetworkInterfaceEnabled           = true
+	dvNetworkInterfaceFirewall          = false
+	dvNetworkInterfaceHostManaged       = false
+	dvNetworkInterfaceRateLimit         = 0
+	dvNetworkInterfaceVLANID            = 0
+	dvNetworkInterfaceMTU               = 0
+	dvOperatingSystemType               = "unmanaged"
+	dvPoolID                            = ""
+	dvProtection                        = false
+	dvStarted                           = true
+	dvStartupOrder                      = -1
+	dvStartupUpDelay                    = -1
+	dvStartupDownDelay                  = -1
+	dvStartOnBoot                       = true
+	dvTemplate                          = false
+	dvTimeoutCreate                     = 1800
+	dvTimeoutClone                      = 1800
+	dvTimeoutUpdate                     = 1800
+	dvTimeoutDelete                     = 60
+	dvUnprivileged                      = false
+
+	maxNetworkInterfaces  = 10
+	maxPassthroughDevices = 128
+	maxMountPoints        = 256
+
+	mkClone                             = "clone"
+	mkCloneDatastoreID                  = "datastore_id"
+	mkCloneFull                         = "full"
+	mkCloneNodeName                     = "node_name"
+	mkCloneVMID                         = "vm_id"
+	mkConsole                           = "console"
+	mkConsoleEnabled                    = "enabled"
+	mkConsoleMode                       = "type"
+	mkConsoleTTYCount                   = "tty_count"
+	mkCPU                               = "cpu"
+	mkCPUArchitecture                   = "architecture"
+	mkCPUCores                          = "cores"
+	mkCPULimit                          = "limit"
+	mkCPUUnits                          = "units"
+	mkDescription                       = "description"
+	mkDisk                              = "disk"
+	mkDiskACL                           = "acl"
+	mkDiskDatastoreID                   = "datastore_id"
+	mkDiskMountOptions                  = "mount_options"
+	mkDiskQuota                         = "quota"
+	mkDiskReplicate                     = "replicate"
+	mkDiskSize                          = "size"
+	mkDiskPathInDatastore               = "path_in_datastore"
+	mkEnvironmentVariables              = "environment_variables"
+	mkFeatures                          = "features"
+	mkFeaturesNesting                   = "nesting"
+	mkFeaturesKeyControl                = "keyctl"
+	mkFeaturesFUSE                      = "fuse"
+	mkFeaturesMakeDeviceNode            = "mknod"
+	mkFeaturesMountTypes                = "mount"
+	mkHookScriptFileID                  = "hook_script_file_id"
+	mkInitialization                    = "initialization"
+	mkInitializationDNS                 = "dns"
+	mkInitializationDNSDomain           = "domain"
+	mkInitializationDNSServer           = "server"
+	mkInitializationDNSServers          = "servers"
+	mkInitializationHostname            = "hostname"
+	mkInitializationIPConfig            = "ip_config"
+	mkInitializationIPConfigIPv4        = "ipv4"
+	mkInitializationIPConfigIPv4Address = "address"
+	mkInitializationIPConfigIPv4Gateway = "gateway"
+	mkInitializationIPConfigIPv6        = "ipv6"
+	mkInitializationIPConfigIPv6Address = "address"
+	mkInitializationIPConfigIPv6Gateway = "gateway"
+	mkInitializationUserAccount         = "user_account"
+	mkInitializationUserAccountKeys     = "keys"
+	mkInitializationUserAccountPassword = "password"
+	mkInitializationEntrypoint          = "entrypoint"
+	mkMemory                            = "memory"
+	mkMemoryDedicated                   = "dedicated"
+	mkMemorySwap                        = "swap"
+	mkMountPoint                        = "mount_point"
+	mkMountPointACL                     = "acl"
+	mkMountPointBackup                  = "backup"
+	mkMountPointMountOptions            = "mount_options"
+	mkMountPointPath                    = "path"
+	mkMountPointQuota                   = "quota"
+	mkMountPointReadOnly                = "read_only"
+	mkMountPointReplicate               = "replicate"
+	mkMountPointShared                  = "shared"
+	mkMountPointSize                    = "size"
+	mkMountPointVolume                  = "volume"
+	mkMountPointPathInDatastore         = "path_in_datastore"
+	mkDevicePassthroughDenyWrite        = "deny_write"
+	mkDevicePassthrough                 = "device_passthrough" // #nosec G101
+	mkDevicePassthroughPath             = "path"
+	mkDevicePassthroughUID              = "uid"
+	mkDevicePassthroughGID              = "gid"
+	mkDevicePassthroughMode             = "mode"
+	mkIDMap                             = "idmap"
+	mkIDMapType                         = "type"
+	mkIDMapContainerID                  = "container_id"
+	mkIDMapHostID                       = "host_id"
+	mkIDMapSize                         = "size"
+	mkNetworkInterface                  = "network_interface"
+	mkNetworkInterfaceBridge            = "bridge"
+	mkNetworkInterfaceEnabled           = "enabled"
+	mkNetworkInterfaceFirewall          = "firewall"
+	mkNetworkInterfaceHostManaged       = "host_managed"
+	mkNetworkInterfaceMACAddress        = "mac_address"
+	mkNetworkInterfaceName              = "name"
+	mkNetworkInterfaceRateLimit         = "rate_limit"
+	mkNetworkInterfaceVLANID            = "vlan_id"
+	mkNetworkInterfaceMTU               = "mtu"
+	mkNodeName                          = "node_name"
+	mkOperatingSystem                   = "operating_system"
+	mkOperatingSystemTemplateFileID     = "template_file_id"
+	mkOperatingSystemType               = "type"
+	mkPoolID                            = "pool_id"
+	mkProtection                        = "protection"
+	mkStarted                           = "started"
+	mkStartup                           = "startup"
+	mkStartupOrder                      = "order"
+	mkStartupUpDelay                    = "up_delay"
+	mkStartupDownDelay                  = "down_delay"
+	mkStartOnBoot                       = "start_on_boot"
+	mkTags                              = "tags"
+	mkTemplate                          = "template"
+	mkTimeoutCreate                     = "timeout_create"
+	mkTimeoutClone                      = "timeout_clone"
+	mkTimeoutUpdate                     = "timeout_update"
+	mkTimeoutDelete                     = "timeout_delete"
+	mkUnprivileged                      = "unprivileged"
+	mkVMID                              = "vm_id"
+
+	mkIPv4          = "ipv4"
+	mkIPv6          = "ipv6"
+	mkWaitForIP     = "wait_for_ip"
+	mkWaitForIPIPv4 = "ipv4"
+	mkWaitForIPIPv6 = "ipv6"
+)
+
+// Container returns a resource that manages a container.
+func Container() *schema.Resource {
+	return &schema.Resource{
+		Schema: map[string]*schema.Schema{
+			mkClone: {
+				Type:        schema.TypeList,
+				Description: "The cloning configuration",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkCloneDatastoreID: {
+							Type:        schema.TypeString,
+							Description: "The ID of the target datastore",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvCloneDatastoreID,
+						},
+						mkCloneNodeName: {
+							Type:        schema.TypeString,
+							Description: "The name of the source node",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvCloneNodeName,
+						},
+						mkCloneFull: {
+							Type: schema.TypeBool,
+							Description: "When cloning, create a full copy of all disks. Set to false to create a linked " +
+								"clone. Linked clones require the source container to be a template on storage that supports " +
+								"copy-on-write (e.g. Ceph RBD). Defaults to true.",
+							Optional: true,
+							ForceNew: true,
+							Default:  dvCloneFull,
+							DiffSuppressFunc: func(_, oldVal, newVal string, d *schema.ResourceData) bool {
+								// Suppress diff when upgrading from a provider version that didn't have this attribute.
+								// In that case oldVal is "" (missing from state) and newVal is "true" (from Default).
+								// Only suppress for existing resources (d.Id() != ""), not during creation.
+								return d.Id() != "" && oldVal == "" && newVal == "true"
+							},
+						},
+						mkCloneVMID: {
+							Type:             schema.TypeInt,
+							Description:      "The ID of the source container",
+							Required:         true,
+							ForceNew:         true,
+							ValidateDiagFunc: vmresource.VMIDValidator(),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkConsole: {
+				Type:        schema.TypeList,
+				Description: "The console configuration",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{
+						map[string]any{
+							mkConsoleEnabled:  dvConsoleEnabled,
+							mkConsoleMode:     dvConsoleMode,
+							mkConsoleTTYCount: dvConsoleTTYCount,
+						},
+					}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkConsoleEnabled: {
+							Type:        schema.TypeBool,
+							Description: "Whether to enable the console device",
+							Optional:    true,
+							Default:     dvConsoleEnabled,
+						},
+						mkConsoleMode: {
+							Type:             schema.TypeString,
+							Description:      "The console mode",
+							Optional:         true,
+							Default:          dvConsoleMode,
+							ValidateDiagFunc: ConsoleModeValidator(),
+						},
+						mkConsoleTTYCount: {
+							Type:             schema.TypeInt,
+							Description:      "The number of available TTY",
+							Optional:         true,
+							Default:          dvConsoleTTYCount,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntBetween(0, 6)),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkCPU: {
+				Type:        schema.TypeList,
+				Description: "The CPU allocation",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{
+						map[string]any{
+							mkCPUArchitecture: dvCPUArchitecture,
+							mkCPUCores:        dvCPUCores,
+							mkCPULimit:        dvCPULimit,
+							mkCPUUnits:        dvCPUUnits,
+						},
+					}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkCPUArchitecture: {
+							Type:             schema.TypeString,
+							Description:      "The CPU architecture",
+							Optional:         true,
+							Default:          dvCPUArchitecture,
+							ValidateDiagFunc: CPUArchitectureValidator(),
+						},
+						mkCPUCores: {
+							Type:             schema.TypeInt,
+							Description:      "The number of CPU cores",
+							Optional:         true,
+							Default:          dvCPUCores,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntBetween(1, 128)),
+						},
+						mkCPULimit: {
+							Type:        schema.TypeFloat,
+							Description: "Limit of CPU usage. Value 0 indicates no limit (defaults to 0).",
+							Optional:    true,
+							Default:     dvCPULimit,
+							ValidateDiagFunc: validation.ToDiagFunc(
+								validation.FloatBetween(0, 8192),
+							),
+						},
+						mkCPUUnits: {
+							Type:        schema.TypeInt,
+							Description: "The CPU units",
+							Optional:    true,
+							Computed:    true,
+							ValidateDiagFunc: validation.ToDiagFunc(
+								validation.IntBetween(1, 500000),
+							),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkDescription: {
+				Type:        schema.TypeString,
+				Description: "The description",
+				Optional:    true,
+				Default:     dvDescription,
+				StateFunc: func(i any) string {
+					// PVE always adds a newline to the description, so we have to do the same,
+					// also taking in account the CLRF case (Windows)
+					if i.(string) != "" {
+						return strings.ReplaceAll(strings.TrimSpace(i.(string)), "\r\n", "\n") + "\n"
+					}
+
+					return ""
+				},
+			},
+			mkDisk: {
+				Type:        schema.TypeList,
+				Description: "The disks",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{
+						map[string]any{
+							mkDiskACL:          dvDiskACL,
+							mkDiskDatastoreID:  dvDiskDatastoreID,
+							mkDiskMountOptions: []any{},
+							mkDiskQuota:        dvDiskQuota,
+							mkDiskReplicate:    dvDiskReplicate,
+							mkDiskSize:         dvDiskSize,
+						},
+					}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkDiskACL: {
+							Type:        schema.TypeBool,
+							Description: "Explicitly enable or disable ACL support",
+							Optional:    true,
+							Default:     dvDiskACL,
+						},
+						mkDiskDatastoreID: {
+							Type:        schema.TypeString,
+							Description: "The datastore id",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvDiskDatastoreID,
+						},
+						mkDiskQuota: {
+							Type:        schema.TypeBool,
+							Description: "Enable user quotas for the container rootfs",
+							Optional:    true,
+							Default:     dvDiskQuota,
+						},
+						mkDiskReplicate: {
+							Type:        schema.TypeBool,
+							Description: "Will include this volume to a storage replica job",
+							Optional:    true,
+							Default:     dvDiskReplicate,
+						},
+						mkDiskSize: {
+							Type:             schema.TypeInt,
+							Description:      "The rootfs size in gigabytes",
+							Optional:         true,
+							Default:          dvDiskSize,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(0)),
+						},
+						mkDiskMountOptions: {
+							Type:        schema.TypeList,
+							Description: "Extra mount options",
+							Optional:    true,
+							Elem: &schema.Schema{
+								Type:         schema.TypeString,
+								ValidateFunc: validation.StringIsNotEmpty,
+							},
+							DiffSuppressFunc:      structure.SuppressIfListsAreEqualIgnoringOrder,
+							DiffSuppressOnRefresh: true,
+						},
+						mkDiskPathInDatastore: {
+							Type:        schema.TypeString,
+							Description: "The in-datastore path to the disk image",
+							Computed:    true,
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkEnvironmentVariables: {
+				Type:        schema.TypeMap,
+				Description: "The runtime environment variables for the container init process.",
+				Optional:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+				ValidateDiagFunc: EnvironmentVariablesValidator(),
+			},
+			mkFeatures: {
+				Type:        schema.TypeList,
+				Description: "Features",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{
+						map[string]any{
+							mkFeaturesNesting:        dvFeaturesNesting,
+							mkFeaturesKeyControl:     dvFeaturesKeyControl,
+							mkFeaturesFUSE:           dvFeaturesFUSE,
+							mkFeaturesMountTypes:     []any{},
+							mkFeaturesMakeDeviceNode: dvFeaturesMakeDeviceNode,
+						},
+					}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkFeaturesNesting: {
+							Type:        schema.TypeBool,
+							Description: "Whether the container runs as nested",
+							Optional:    true,
+							Default:     dvFeaturesNesting,
+						},
+						mkFeaturesKeyControl: {
+							Type:        schema.TypeBool,
+							Description: "Whether the container supports `keyctl()` system call",
+							Optional:    true,
+							Default:     dvFeaturesKeyControl,
+						},
+						mkFeaturesFUSE: {
+							Type:        schema.TypeBool,
+							Description: "Whether the container supports FUSE mounts",
+							Optional:    true,
+							Default:     dvFeaturesFUSE,
+						},
+						mkFeaturesMountTypes: {
+							Type:        schema.TypeList,
+							Description: "List of allowed mount types",
+							Optional:    true,
+							Elem: &schema.Schema{
+								Type:             schema.TypeString,
+								ValidateDiagFunc: MountTypeValidator(),
+							},
+						},
+						mkFeaturesMakeDeviceNode: {
+							Type:        schema.TypeBool,
+							Description: "Whether the container supports `mknod()` system call",
+							Optional:    true,
+							Default:     dvFeaturesMakeDeviceNode,
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkHookScriptFileID: {
+				Type:        schema.TypeString,
+				Description: "A hook script",
+				Optional:    true,
+				Default:     dvHookScript,
+			},
+			mkInitialization: {
+				Type:        schema.TypeList,
+				Description: "The initialization configuration",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkInitializationDNS: {
+							Type:        schema.TypeList,
+							Description: "The DNS configuration",
+							Optional:    true,
+							DefaultFunc: func() (any, error) {
+								return []any{}, nil
+							},
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									mkInitializationDNSDomain: {
+										Type:        schema.TypeString,
+										Description: "The DNS search domain",
+										Optional:    true,
+										Default:     dvInitializationDNSDomain,
+									},
+									mkInitializationDNSServer: {
+										Type:        schema.TypeString,
+										Description: "The DNS server",
+										Deprecated: "The `server` attribute is deprecated and will be removed in a future release. " +
+											"Please use the `servers` attribute instead.",
+										Optional: true,
+										Default:  dvInitializationDNSServer,
+									},
+									mkInitializationDNSServers: {
+										Type:        schema.TypeList,
+										Description: "The list of DNS servers",
+										Optional:    true,
+										Elem:        &schema.Schema{Type: schema.TypeString, ValidateFunc: validation.IsIPAddress},
+										MinItems:    1,
+									},
+								},
+							},
+							MaxItems:         1,
+							DiffSuppressFunc: skipDnsDiffIfEmpty,
+						},
+						mkInitializationHostname: {
+							Type:             schema.TypeString,
+							Description:      "The hostname. Must be a valid DNS name.",
+							Optional:         true,
+							Default:          dvInitializationHostname,
+							ValidateDiagFunc: vmresource.HostnameValidator(),
+						},
+						mkInitializationIPConfig: {
+							Type:        schema.TypeList,
+							Description: "The IP configuration",
+							Optional:    true,
+							DefaultFunc: func() (any, error) {
+								return []any{}, nil
+							},
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									mkInitializationIPConfigIPv4: {
+										Type:        schema.TypeList,
+										Description: "The IPv4 configuration",
+										Optional:    true,
+										DefaultFunc: func() (any, error) {
+											return []any{}, nil
+										},
+										Elem: &schema.Resource{
+											Schema: map[string]*schema.Schema{
+												mkInitializationIPConfigIPv4Address: {
+													Type:        schema.TypeString,
+													Description: "The IPv4 address",
+													Optional:    true,
+													Default:     dvInitializationIPConfigIPv4Address,
+												},
+												mkInitializationIPConfigIPv4Gateway: {
+													Type:        schema.TypeString,
+													Description: "The IPv4 gateway",
+													Optional:    true,
+													Default:     dvInitializationIPConfigIPv4Gateway,
+												},
+											},
+										},
+										MaxItems: 1,
+										MinItems: 0,
+									},
+									mkInitializationIPConfigIPv6: {
+										Type:        schema.TypeList,
+										Description: "The IPv6 configuration",
+										Optional:    true,
+										DefaultFunc: func() (any, error) {
+											return []any{}, nil
+										},
+										Elem: &schema.Resource{
+											Schema: map[string]*schema.Schema{
+												mkInitializationIPConfigIPv6Address: {
+													Type:        schema.TypeString,
+													Description: "The IPv6 address",
+													Optional:    true,
+													Default:     dvInitializationIPConfigIPv6Address,
+												},
+												mkInitializationIPConfigIPv6Gateway: {
+													Type:        schema.TypeString,
+													Description: "The IPv6 gateway",
+													Optional:    true,
+													Default:     dvInitializationIPConfigIPv6Gateway,
+												},
+											},
+										},
+										MaxItems: 1,
+										MinItems: 0,
+									},
+								},
+							},
+							MaxItems: maxNetworkInterfaces,
+							MinItems: 0,
+						},
+						mkInitializationUserAccount: {
+							Type:        schema.TypeList,
+							Description: "The user account configuration",
+							Optional:    true,
+							ForceNew:    true,
+							DefaultFunc: func() (any, error) {
+								return []any{}, nil
+							},
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									mkInitializationUserAccountKeys: {
+										Type:        schema.TypeList,
+										Description: "The SSH keys",
+										Optional:    true,
+										ForceNew:    true,
+										DefaultFunc: func() (any, error) {
+											return []any{}, nil
+										},
+										Elem: &schema.Schema{Type: schema.TypeString},
+									},
+									mkInitializationUserAccountPassword: {
+										Type:        schema.TypeString,
+										Description: "The SSH password",
+										Optional:    true,
+										ForceNew:    true,
+										Sensitive:   true,
+										Default:     dvInitializationUserAccountPassword,
+										DiffSuppressFunc: func(_, oldVal, _ string, _ *schema.ResourceData) bool {
+											return len(oldVal) > 0 &&
+												strings.ReplaceAll(oldVal, "*", "") == ""
+										},
+									},
+								},
+							},
+							MaxItems: 1,
+							MinItems: 0,
+						},
+						mkInitializationEntrypoint: {
+							Type:        schema.TypeString,
+							Description: "Command to run as init, optionally with arguments. It may start with an absolute path, relative path, or a binary in `$PATH`.",
+							Optional:    true,
+							Default:     dvInitializationEntrypoint,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringMatch(
+								regexp.MustCompile(`^[^\x00-\x08\x10-\x1F\x7F]+$`), "Disallow Invalid Characters",
+							)),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkIPv4: {
+				Type:        schema.TypeMap,
+				Description: "The container's IPv4 addresses per network device",
+				Computed:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			mkIPv6: {
+				Type:        schema.TypeMap,
+				Description: "The container's IPv6 addresses per network device",
+				Computed:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			mkMemory: {
+				Type:        schema.TypeList,
+				Description: "The memory allocation",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return []any{
+						map[string]any{
+							mkMemoryDedicated: dvMemoryDedicated,
+							mkMemorySwap:      dvMemorySwap,
+						},
+					}, nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkMemoryDedicated: {
+							Type:        schema.TypeInt,
+							Description: "The dedicated memory in megabytes",
+							Optional:    true,
+							Default:     dvMemoryDedicated,
+							ValidateDiagFunc: validation.ToDiagFunc(
+								validation.IntBetween(16, 268435456),
+							),
+						},
+						mkMemorySwap: {
+							Type:        schema.TypeInt,
+							Description: "The swap size in megabytes",
+							Optional:    true,
+							Default:     dvMemorySwap,
+							ValidateDiagFunc: validation.ToDiagFunc(
+								validation.IntBetween(0, 268435456),
+							),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkMountPoint: {
+				Type:        schema.TypeList,
+				Description: "A mount point",
+				Optional:    true,
+				ForceNew:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkMountPointACL: {
+							Type:        schema.TypeBool,
+							Description: "Explicitly enable or disable ACL support",
+							Optional:    true,
+							Default:     dvMountPointACL,
+						},
+						mkMountPointBackup: {
+							Type:        schema.TypeBool,
+							Description: "Whether to include the mount point in backups (only used for volume mount points)",
+							Optional:    true,
+							Default:     dvMountPointBackup,
+						},
+						mkMountPointMountOptions: {
+							Type:        schema.TypeList,
+							Description: "Extra mount options.",
+							Optional:    true,
+							Elem: &schema.Schema{
+								Type: schema.TypeString,
+							},
+						},
+						mkMountPointPath: {
+							Type:        schema.TypeString,
+							Description: "Path to the mount point as seen from inside the container",
+							Required:    true,
+							DiffSuppressFunc: func(_, oldVal, newVal string, _ *schema.ResourceData) bool {
+								return "/"+oldVal == newVal
+							},
+						},
+						mkMountPointQuota: {
+							Type:        schema.TypeBool,
+							Description: "Enable user quotas inside the container (not supported with volume mounts)",
+							Optional:    true,
+							Default:     dvMountPointQuota,
+						},
+						mkMountPointReadOnly: {
+							Type:        schema.TypeBool,
+							Description: "Read-only mount point",
+							Optional:    true,
+							Default:     dvMountPointReadOnly,
+						},
+						mkMountPointReplicate: {
+							Type:        schema.TypeBool,
+							Description: "Will include this volume to a storage replica job",
+							Optional:    true,
+							Default:     dvMountPointReplicate,
+						},
+						mkMountPointShared: {
+							Type:        schema.TypeBool,
+							Description: "Mark this non-volume mount point as available on all nodes",
+							Optional:    true,
+							Default:     dvMountPointShared,
+						},
+						mkMountPointSize: {
+							Type:             schema.TypeString,
+							Description:      "Volume size (only used for volume mount points)",
+							Optional:         true,
+							Default:          dvMountPointSize,
+							ForceNew:         true,
+							ValidateDiagFunc: validators.FileSize(),
+						},
+						mkMountPointVolume: {
+							Type:        schema.TypeString,
+							Description: "Volume, device or directory to mount into the container",
+							Required:    true,
+							ForceNew:    true,
+							DiffSuppressFunc: func(_, oldVal, newVal string, _ *schema.ResourceData) bool {
+								// For *new* volume mounts PVE returns an actual volume ID which is saved in the state,
+								// so on reapply the provider will try override it:
+								//   "local-lvm" -> "local-lvm:vm-101-disk-1"
+								//   "local-lvm:8" -> "local-lvm:vm-101-disk-1"
+								// There is also an option to mount an existing volume, so
+								//   "local-lvm:vm-101-disk-1" -> "local-lvm:vm-101-disk-1"
+								// which is a valid case.
+								return oldVal == newVal || strings.HasPrefix(oldVal, strings.Split(newVal, ":")[0]+":")
+							},
+						},
+						mkMountPointPathInDatastore: {
+							Type:        schema.TypeString,
+							Description: "The in-datastore path to the mount point volume",
+							Computed:    true,
+						},
+					},
+				},
+				MaxItems: maxMountPoints,
+				MinItems: 0,
+			},
+			mkIDMap: {
+				Type:        schema.TypeList,
+				Description: "UID/GID mapping for unprivileged containers",
+				Optional:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkIDMapType: {
+							Type:             schema.TypeString,
+							Description:      "Mapping type (uid or gid)",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringInSlice([]string{"uid", "gid"}, false)),
+						},
+						mkIDMapContainerID: {
+							Type:             schema.TypeInt,
+							Description:      "Starting ID in the container namespace",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(0)),
+						},
+						mkIDMapHostID: {
+							Type:             schema.TypeInt,
+							Description:      "Starting ID in the host namespace",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(0)),
+						},
+						mkIDMapSize: {
+							Type:             schema.TypeInt,
+							Description:      "Number of IDs to map",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(1)),
+						},
+					},
+				},
+			},
+			mkDevicePassthrough: {
+				Type:        schema.TypeList,
+				Description: "Device to pass through to the container",
+				Optional:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkDevicePassthroughDenyWrite: {
+							Type:        schema.TypeBool,
+							Description: "Deny the container to write to the device",
+							Optional:    true,
+							Default:     false,
+						},
+						mkDevicePassthroughGID: {
+							Type:             schema.TypeInt,
+							Description:      "Group ID to be assigned to the device node",
+							Optional:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(0)),
+						},
+						mkDevicePassthroughMode: {
+							Type:        schema.TypeString,
+							Description: "Access mode to be set on the device node (e.g. 0666)",
+							Optional:    true,
+							Default:     dvDevicePassthroughMode,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringMatch(
+								regexp.MustCompile(`0[0-7]{3}`), "Octal access mode",
+							)),
+						},
+						mkDevicePassthroughPath: {
+							Type:             schema.TypeString,
+							Description:      "Device to pass through to the container",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotEmpty),
+						},
+						mkDevicePassthroughUID: {
+							Type:             schema.TypeInt,
+							Description:      "Device UID in the container",
+							Optional:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(0)),
+						},
+					},
+				},
+				MaxItems: maxPassthroughDevices,
+				MinItems: 0,
+			},
+			mkNetworkInterface: {
+				Type:        schema.TypeList,
+				Description: "The network interfaces",
+				Optional:    true,
+				DefaultFunc: func() (any, error) {
+					return make([]any, 1), nil
+				},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkNetworkInterfaceBridge: {
+							Type:        schema.TypeString,
+							Description: "The bridge",
+							Optional:    true,
+							Default:     dvNetworkInterfaceBridge,
+						},
+						mkNetworkInterfaceEnabled: {
+							Type:        schema.TypeBool,
+							Description: "Whether to enable the network device",
+							Optional:    true,
+							Default:     dvNetworkInterfaceEnabled,
+						},
+						mkNetworkInterfaceFirewall: {
+							Type:        schema.TypeBool,
+							Description: "Whether this interface's firewall rules should be used.",
+							Optional:    true,
+							Default:     dvNetworkInterfaceFirewall,
+						},
+						mkNetworkInterfaceHostManaged: {
+							Type:        schema.TypeBool,
+							Description: "Whether the host runs DHCP on this interface's behalf. Requires Proxmox VE 9.1+.",
+							Optional:    true,
+							Default:     dvNetworkInterfaceHostManaged,
+						},
+						mkNetworkInterfaceMACAddress: {
+							Type:        schema.TypeString,
+							Description: "The MAC address",
+							Optional:    true,
+							Computed:    true,
+							DiffSuppressFunc: func(_, _, newVal string, _ *schema.ResourceData) bool {
+								return newVal == ""
+							},
+							ValidateDiagFunc: validators.MACAddress(),
+						},
+						mkNetworkInterfaceName: {
+							Type:        schema.TypeString,
+							Description: "The network interface name",
+							Required:    true,
+						},
+						mkNetworkInterfaceRateLimit: {
+							Type:        schema.TypeFloat,
+							Description: "The rate limit in megabytes per second",
+							Optional:    true,
+							Default:     dvNetworkInterfaceRateLimit,
+						},
+						mkNetworkInterfaceVLANID: {
+							Type:        schema.TypeInt,
+							Description: "The VLAN identifier",
+							Optional:    true,
+							Default:     dvNetworkInterfaceVLANID,
+						},
+						mkNetworkInterfaceMTU: {
+							Type:        schema.TypeInt,
+							Description: "Maximum transmission unit (MTU)",
+							Optional:    true,
+							Default:     dvNetworkInterfaceMTU,
+						},
+					},
+				},
+				MaxItems: maxNetworkInterfaces,
+				MinItems: 0,
+			},
+			mkNodeName: {
+				Type:        schema.TypeString,
+				Description: "The node name",
+				Required:    true,
+				ForceNew:    true,
+			},
+			mkOperatingSystem: {
+				Type:        schema.TypeList,
+				Description: "The operating system configuration",
+				Optional:    true,
+				ForceNew:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkOperatingSystemTemplateFileID: {
+							Type:             schema.TypeString,
+							Description:      "The ID of an OS template file",
+							Required:         true,
+							ForceNew:         true,
+							ValidateDiagFunc: validators.FileID(),
+						},
+						mkOperatingSystemType: {
+							Type:             schema.TypeString,
+							Description:      "The type",
+							Optional:         true,
+							Default:          dvOperatingSystemType,
+							ValidateDiagFunc: OperatingSystemTypeValidator(),
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkPoolID: {
+				Type:        schema.TypeString,
+				Description: "The ID of the pool to assign the container to",
+				Optional:    true,
+				ForceNew:    true,
+				Default:     dvPoolID,
+			},
+			mkProtection: {
+				Type: schema.TypeBool,
+				Description: "Whether to set the protection flag of the container. " +
+					"This will prevent the container itself and its disk for remove/update operations.",
+				Optional: true,
+				ForceNew: false,
+				Default:  dvProtection,
+			},
+			mkStarted: {
+				Type:        schema.TypeBool,
+				Description: "Whether to start the container",
+				Optional:    true,
+				Default:     dvStarted,
+				DiffSuppressFunc: func(_, _, _ string, d *schema.ResourceData) bool {
+					return d.Get(mkTemplate).(bool)
+				},
+			},
+			mkStartup: {
+				Type:        schema.TypeList,
+				Description: "Defines startup and shutdown behavior of the container",
+				Optional:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkStartupOrder: {
+							Type:        schema.TypeInt,
+							Description: "A non-negative number defining the general startup order",
+							Optional:    true,
+							Default:     dvStartupOrder,
+						},
+						mkStartupUpDelay: {
+							Type:        schema.TypeInt,
+							Description: "A non-negative number defining the delay in seconds before the next container is started",
+							Optional:    true,
+							Default:     dvStartupUpDelay,
+						},
+						mkStartupDownDelay: {
+							Type:        schema.TypeInt,
+							Description: "A non-negative number defining the delay in seconds before the next container is shut down",
+							Optional:    true,
+							Default:     dvStartupDownDelay,
+						},
+					},
+				},
+				MaxItems: 1,
+				MinItems: 0,
+			},
+			mkStartOnBoot: {
+				Type:        schema.TypeBool,
+				Description: "Automatically start container when the host system boots.",
+				Optional:    true,
+				ForceNew:    false,
+				Default:     dvStartOnBoot,
+			},
+			mkTags: {
+				Type:        schema.TypeList,
+				Description: "Tags of the container. This is only meta information.",
+				Optional:    true,
+				Elem: &schema.Schema{
+					Type:         schema.TypeString,
+					ValidateFunc: validation.StringIsNotEmpty,
+				},
+				DiffSuppressFunc:      structure.SuppressIfListsAreEqualIgnoringOrder,
+				DiffSuppressOnRefresh: true,
+			},
+			mkTemplate: {
+				Type:        schema.TypeBool,
+				Description: "Whether to create a template",
+				Optional:    true,
+				ForceNew:    true,
+				Default:     dvTemplate,
+			},
+			mkTimeoutCreate: {
+				Type:        schema.TypeInt,
+				Description: "Create container timeout",
+				Optional:    true,
+				Default:     dvTimeoutCreate,
+			},
+			mkTimeoutClone: {
+				Type:        schema.TypeInt,
+				Description: "Clone container timeout",
+				Optional:    true,
+				Default:     dvTimeoutClone,
+			},
+			mkTimeoutUpdate: {
+				Type:        schema.TypeInt,
+				Description: "Update container timeout",
+				Optional:    true,
+				Default:     dvTimeoutUpdate,
+			},
+			mkTimeoutDelete: {
+				Type:        schema.TypeInt,
+				Description: "Delete container timeout",
+				Optional:    true,
+				Default:     dvTimeoutDelete,
+			},
+			"timeout_start": {
+				Type:        schema.TypeInt,
+				Description: "Start container timeout",
+				Optional:    true,
+				Default:     300,
+				Deprecated: "This field is deprecated and will be removed in a future release. " +
+					"An overall operation timeout (`timeout_create` / `timeout_clone`) is used instead.",
+			},
+			mkWaitForIP: {
+				Type:        schema.TypeList,
+				Description: "Configuration for waiting for specific IP address types",
+				Optional:    true,
+				MaxItems:    1,
+				MinItems:    0,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkWaitForIPIPv4: {
+							Type:        schema.TypeBool,
+							Description: "Wait for at least one IPv4 address (non-loopback, non-link-local)",
+							Optional:    true,
+							Default:     false,
+						},
+						mkWaitForIPIPv6: {
+							Type:        schema.TypeBool,
+							Description: "Wait for at least one IPv6 address (non-loopback, non-link-local)",
+							Optional:    true,
+							Default:     false,
+						},
+					},
+				},
+			},
+			mkUnprivileged: {
+				Type:        schema.TypeBool,
+				Description: "Whether the container runs as unprivileged on the host",
+				Optional:    true,
+				ForceNew:    true,
+				Default:     dvUnprivileged,
+			},
+			mkVMID: {
+				Type:             schema.TypeInt,
+				Description:      "The VM identifier",
+				Optional:         true,
+				Computed:         true,
+				ValidateDiagFunc: vmresource.VMIDValidator(),
+			},
+		},
+		CreateContext: containerCreate,
+		ReadContext:   containerRead,
+		UpdateContext: containerUpdate,
+		DeleteContext: containerDelete,
+		CustomizeDiff: customdiff.All(
+			customdiff.ForceNewIf(
+				mkVMID,
+				func(_ context.Context, d *schema.ResourceDiff, _ any) bool {
+					newValue := d.Get(mkVMID)
+
+					// 'vm_id' is ForceNew, except when changing 'vm_id' to existing correct id
+					// (automatic fix from -1 to actual vm_id must not re-create VM)
+					return strconv.Itoa(newValue.(int)) != d.Id()
+				},
+			),
+			// Force recreation if disk is being shrunk (shrinking not supported, only growing)
+			customdiff.ForceNewIf(
+				mkDisk,
+				func(_ context.Context, d *schema.ResourceDiff, _ any) bool {
+					oldRaw, newRaw := d.GetChange(mkDisk)
+					oldList, _ := oldRaw.([]any)
+					newList, _ := newRaw.([]any)
+
+					if oldList == nil {
+						oldList = []any{}
+					}
+
+					if newList == nil {
+						newList = []any{}
+					}
+
+					minDrives := min(len(oldList), len(newList))
+
+					for i := range minDrives {
+						oldSize := dvDiskSize
+						newSize := dvDiskSize
+
+						if i < len(oldList) && oldList[i] != nil {
+							if om, ok := oldList[i].(map[string]any); ok {
+								if v, ok := om[mkDiskSize].(int); ok {
+									oldSize = v
+								}
+							}
+						}
+
+						if i < len(newList) && newList[i] != nil {
+							if nm, ok := newList[i].(map[string]any); ok {
+								if v, ok := nm[mkDiskSize].(int); ok {
+									newSize = v
+								}
+							}
+						}
+
+						if oldSize > newSize {
+							// Shrinking is not supported, force recreation
+							return true
+						}
+					}
+
+					return false
+				},
+			),
+		),
+		Importer: &schema.ResourceImporter{
+			StateContext: func(_ context.Context, d *schema.ResourceData, _ any) ([]*schema.ResourceData, error) {
+				node, id, err := parseImportIDWithNodeName(d.Id())
+				if err != nil {
+					return nil, err
+				}
+
+				d.SetId(id)
+
+				err = d.Set(mkNodeName, node)
+				if err != nil {
+					return nil, fmt.Errorf("failed setting state during import: %w", err)
+				}
+
+				return []*schema.ResourceData{d}, nil
+			},
+		},
+	}
+}
+
+func containerCreate(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	clone := d.Get(mkClone).([]any)
+
+	if len(clone) > 0 {
+		return containerCreateClone(ctx, d, m)
+	}
+
+	return containerCreateCustom(ctx, d, m)
+}
+
+func containerCreateClone(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	cloneTimeoutSec := d.Get(mkTimeoutClone).(int)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cloneTimeoutSec)*time.Second)
+	defer cancel()
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	clone := d.Get(mkClone).([]any)
+	cloneBlock := clone[0].(map[string]any)
+	cloneDatastoreID := cloneBlock[mkCloneDatastoreID].(string)
+	cloneNodeName := cloneBlock[mkCloneNodeName].(string)
+	cloneVMID := cloneBlock[mkCloneVMID].(int)
+
+	description := d.Get(mkDescription).(string)
+
+	initialization := d.Get(mkInitialization).([]any)
+	initializationHostname := ""
+
+	if len(initialization) > 0 && initialization[0] != nil {
+		initializationBlock := initialization[0].(map[string]any)
+		initializationHostname = initializationBlock[mkInitializationHostname].(string)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+	poolID := d.Get(mkPoolID).(string)
+	tags := d.Get(mkTags).([]any)
+	vmIDUntyped, hasVMID := d.GetOk(mkVMID)
+	vmID := vmIDUntyped.(int)
+
+	if !hasVMID {
+		vmIDNew, err := config.GetIDGenerator().NextID(ctx)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		vmID = vmIDNew
+
+		err = d.Set(mkVMID, vmID)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	fullCopy := types.CustomBool(cloneBlock[mkCloneFull].(bool))
+
+	cloneBody := &containers.CloneRequestBody{
+		FullCopy: &fullCopy,
+		VMIDNew:  vmID,
+	}
+
+	if cloneDatastoreID != "" {
+		cloneBody.TargetStorage = &cloneDatastoreID
+	}
+
+	if description != "" {
+		cloneBody.Description = &description
+	}
+
+	if initializationHostname != "" {
+		cloneBody.Hostname = &initializationHostname
+	}
+
+	if poolID != "" {
+		cloneBody.PoolID = &poolID
+	}
+
+	var cloneResult tasks.TaskResult
+
+	if cloneNodeName != "" && cloneNodeName != nodeName {
+		cloneBody.TargetNodeName = &nodeName
+
+		cloneResult = client.Node(cloneNodeName).Container(cloneVMID).CloneContainer(ctx, cloneBody)
+	} else {
+		cloneResult = client.Node(nodeName).Container(cloneVMID).CloneContainer(ctx, cloneBody)
+	}
+
+	diags := sdkresource.TaskResultDiags(cloneResult, "Container clone")
+	if diags.HasError() {
+		return diags
+	}
+
+	d.SetId(strconv.Itoa(vmID))
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Now that the virtual machine has been cloned, we need to perform some modifications.
+	updateBody := &containers.UpdateRequestBody{}
+
+	startOnBoot := types.CustomBool(d.Get(mkStartOnBoot).(bool))
+	updateBody.StartOnBoot = &startOnBoot
+
+	features, err := containerGetFeatures(Container(), d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	updateBody.Features = features
+
+	protection := types.CustomBool(d.Get(mkProtection).(bool))
+	updateBody.Protection = &protection
+
+	updateBody.StartupBehavior = containerGetStartupBehavior(d)
+
+	console := d.Get(mkConsole).([]any)
+
+	if len(console) > 0 && console[0] != nil {
+		consoleBlock := console[0].(map[string]any)
+
+		consoleEnabled := types.CustomBool(
+			consoleBlock[mkConsoleEnabled].(bool),
+		)
+		consoleMode := consoleBlock[mkConsoleMode].(string)
+		consoleTTYCount := consoleBlock[mkConsoleTTYCount].(int)
+
+		updateBody.ConsoleEnabled = &consoleEnabled
+		updateBody.ConsoleMode = &consoleMode
+		updateBody.TTY = &consoleTTYCount
+	}
+
+	cpu := d.Get(mkCPU).([]any)
+
+	if len(cpu) > 0 && cpu[0] != nil {
+		cpuBlock := cpu[0].(map[string]any)
+
+		cpuArchitecture := cpuBlock[mkCPUArchitecture].(string)
+		cpuCores := cpuBlock[mkCPUCores].(int)
+		cpuLimit := cpuBlock[mkCPULimit].(float64)
+		cpuUnits := cpuBlock[mkCPUUnits].(int)
+
+		updateBody.CPUArchitecture = &cpuArchitecture
+		updateBody.CPUCores = &cpuCores
+
+		if cpuLimit > 0 {
+			updateBody.CPULimit = &cpuLimit
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "cpulimit")
+		}
+
+		if cpuUnits > 0 {
+			updateBody.CPUUnits = &cpuUnits
+		}
+	}
+
+	hookScript := d.Get(mkHookScriptFileID).(string)
+
+	if hookScript != "" {
+		updateBody.HookScript = &hookScript
+	}
+
+	var initializationIPConfigIPv4Address []string
+
+	var initializationIPConfigIPv4Gateway []string
+
+	var initializationIPConfigIPv6Address []string
+
+	var initializationIPConfigIPv6Gateway []string
+
+	if len(initialization) > 0 && initialization[0] != nil {
+		initializationBlock := initialization[0].(map[string]any)
+		initializationDNS := initializationBlock[mkInitializationDNS].([]any)
+
+		if len(initializationDNS) > 0 && initializationDNS[0] != nil {
+			initializationDNSBlock := initializationDNS[0].(map[string]any)
+
+			initializationDNSDomain := initializationDNSBlock[mkInitializationDNSDomain].(string)
+			if initializationDNSDomain != "" {
+				updateBody.DNSDomain = &initializationDNSDomain
+			}
+
+			servers := initializationDNSBlock[mkInitializationDNSServers].([]any)
+			deprecatedServer := initializationDNSBlock[mkInitializationDNSServer].(string)
+
+			if len(servers) > 0 {
+				nameserver := strings.Join(utils.ConvertToStringSlice(servers), " ")
+
+				updateBody.DNSServer = &nameserver
+			} else if deprecatedServer != "" {
+				updateBody.DNSServer = &deprecatedServer
+			}
+		}
+
+		initializationHostname = initializationBlock[mkInitializationHostname].(string)
+
+		if initializationHostname != dvInitializationHostname {
+			updateBody.Hostname = &initializationHostname
+		}
+
+		initializationEntrypoint := initializationBlock[mkInitializationEntrypoint].(string)
+
+		if initializationEntrypoint != dvInitializationEntrypoint {
+			updateBody.Entrypoint = &initializationEntrypoint
+		}
+
+		initializationIPConfig := initializationBlock[mkInitializationIPConfig].([]any)
+
+		for _, c := range initializationIPConfig {
+			if c == nil {
+				continue
+			}
+
+			configBlock := c.(map[string]any)
+			ipv4 := configBlock[mkInitializationIPConfigIPv4].([]any)
+
+			if len(ipv4) > 0 && ipv4[0] != nil {
+				ipv4Block := ipv4[0].(map[string]any)
+
+				initializationIPConfigIPv4Address = append(
+					initializationIPConfigIPv4Address,
+					ipv4Block[mkInitializationIPConfigIPv4Address].(string),
+				)
+
+				initializationIPConfigIPv4Gateway = append(
+					initializationIPConfigIPv4Gateway,
+					ipv4Block[mkInitializationIPConfigIPv4Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv4Address = append(initializationIPConfigIPv4Address, "")
+				initializationIPConfigIPv4Gateway = append(initializationIPConfigIPv4Gateway, "")
+			}
+
+			ipv6 := configBlock[mkInitializationIPConfigIPv6].([]any)
+
+			if len(ipv6) > 0 && ipv6[0] != nil {
+				ipv6Block := ipv6[0].(map[string]any)
+
+				initializationIPConfigIPv6Address = append(
+					initializationIPConfigIPv6Address,
+					ipv6Block[mkInitializationIPConfigIPv6Address].(string),
+				)
+
+				initializationIPConfigIPv6Gateway = append(
+					initializationIPConfigIPv6Gateway,
+					ipv6Block[mkInitializationIPConfigIPv6Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv6Address = append(initializationIPConfigIPv6Address, "")
+				initializationIPConfigIPv6Gateway = append(initializationIPConfigIPv6Gateway, "")
+			}
+		}
+
+		initializationUserAccount := initializationBlock[mkInitializationUserAccount].([]any)
+
+		if len(initializationUserAccount) > 0 && initializationUserAccount[0] != nil {
+			initializationUserAccountBlock := initializationUserAccount[0].(map[string]any)
+			keys := initializationUserAccountBlock[mkInitializationUserAccountKeys].([]any)
+
+			if len(keys) > 0 {
+				initializationUserAccountKeys := make(
+					containers.CustomSSHKeys,
+					len(keys),
+				)
+
+				for ki, kv := range keys {
+					initializationUserAccountKeys[ki] = kv.(string)
+				}
+
+				updateBody.SSHKeys = &initializationUserAccountKeys
+			} else {
+				updateBody.Delete = append(updateBody.Delete, "ssh-public-keys")
+			}
+
+			initializationUserAccountPassword := initializationUserAccountBlock[mkInitializationUserAccountPassword].(string)
+
+			if initializationUserAccountPassword != dvInitializationUserAccountPassword {
+				updateBody.Password = &initializationUserAccountPassword
+			} else {
+				updateBody.Delete = append(updateBody.Delete, "password")
+			}
+		}
+	}
+
+	memory := d.Get(mkMemory).([]any)
+
+	if len(memory) > 0 && memory[0] != nil {
+		memoryBlock := memory[0].(map[string]any)
+
+		memoryDedicated := memoryBlock[mkMemoryDedicated].(int)
+		memorySwap := memoryBlock[mkMemorySwap].(int)
+
+		updateBody.DedicatedMemory = &memoryDedicated
+		updateBody.Swap = &memorySwap
+	}
+
+	devicePassthrough := d.Get(mkDevicePassthrough).([]any)
+
+	passthroughDevices := make(
+		containers.CustomPassthroughDevices,
+		len(devicePassthrough),
+	)
+
+	for di, dv := range devicePassthrough {
+		devicePassthroughMap := dv.(map[string]any)
+		devicePassthroughObject := containers.CustomPassthroughDevice{}
+
+		denyWrite := types.CustomBool(
+			devicePassthroughMap[mkDevicePassthroughDenyWrite].(bool),
+		)
+		gid := devicePassthroughMap[mkDevicePassthroughGID].(int)
+		mode := devicePassthroughMap[mkDevicePassthroughMode].(string)
+		path := devicePassthroughMap[mkDevicePassthroughPath].(string)
+		uid := devicePassthroughMap[mkDevicePassthroughUID].(int)
+
+		devicePassthroughObject.DenyWrite = &denyWrite
+		devicePassthroughObject.GID = &gid
+		devicePassthroughObject.Mode = &mode
+		devicePassthroughObject.Path = path
+		devicePassthroughObject.UID = &uid
+
+		passthroughDevices[fmt.Sprintf("dev%d", di)] = &devicePassthroughObject
+	}
+
+	updateBody.PassthroughDevices = passthroughDevices
+
+	idmaps := containerGetIDMaps(d.Get(mkIDMap).([]any))
+
+	networkInterface := d.Get(mkNetworkInterface).([]any)
+
+	if len(networkInterface) == 0 {
+		networkInterface, err = containerGetExistingNetworkInterface(ctx, containerAPI)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	networkInterfaces := make(
+		containers.CustomNetworkInterfaces,
+		len(networkInterface),
+	)
+
+	hostManagedSupported := supportContainerHostManaged(ctx, client)
+
+	for ni, nv := range networkInterface {
+		networkInterfaceMap := nv.(map[string]any)
+		networkInterfaceObject := containers.CustomNetworkInterface{}
+
+		bridge := networkInterfaceMap[mkNetworkInterfaceBridge].(string)
+		enabled := networkInterfaceMap[mkNetworkInterfaceEnabled].(bool)
+		firewall := types.CustomBool(
+			networkInterfaceMap[mkNetworkInterfaceFirewall].(bool),
+		)
+		hostManaged := networkInterfaceMap[mkNetworkInterfaceHostManaged].(bool)
+		macAddress := networkInterfaceMap[mkNetworkInterfaceMACAddress].(string)
+		name := networkInterfaceMap[mkNetworkInterfaceName].(string)
+		rateLimit := networkInterfaceMap[mkNetworkInterfaceRateLimit].(float64)
+		vlanID := networkInterfaceMap[mkNetworkInterfaceVLANID].(int)
+		mtu, _ := networkInterfaceMap[mkNetworkInterfaceMTU].(int)
+
+		if bridge != "" {
+			networkInterfaceObject.Bridge = &bridge
+		}
+
+		networkInterfaceObject.Enabled = enabled
+		networkInterfaceObject.Firewall = &firewall
+
+		if hostManagedSupported || hostManaged {
+			networkInterfaceObject.HostManaged = types.CustomBool(hostManaged).Pointer()
+		}
+
+		if len(initializationIPConfigIPv4Address) > ni {
+			if initializationIPConfigIPv4Address[ni] != "" {
+				networkInterfaceObject.IPv4Address = &initializationIPConfigIPv4Address[ni]
+			}
+
+			if initializationIPConfigIPv4Gateway[ni] != "" {
+				networkInterfaceObject.IPv4Gateway = &initializationIPConfigIPv4Gateway[ni]
+			}
+
+			if initializationIPConfigIPv6Address[ni] != "" {
+				networkInterfaceObject.IPv6Address = &initializationIPConfigIPv6Address[ni]
+			}
+
+			if initializationIPConfigIPv6Gateway[ni] != "" {
+				networkInterfaceObject.IPv6Gateway = &initializationIPConfigIPv6Gateway[ni]
+			}
+		}
+
+		if macAddress != "" {
+			networkInterfaceObject.MACAddress = &macAddress
+		}
+
+		networkInterfaceObject.Name = name
+
+		if rateLimit != 0 {
+			networkInterfaceObject.RateLimit = &rateLimit
+		}
+
+		if vlanID != 0 {
+			networkInterfaceObject.Tag = &vlanID
+		}
+
+		if mtu != 0 {
+			networkInterfaceObject.MTU = &mtu
+		}
+
+		networkInterfaces[fmt.Sprintf("net%d", ni)] = &networkInterfaceObject
+	}
+
+	updateBody.NetworkInterfaces = networkInterfaces
+
+	for key, ni := range updateBody.NetworkInterfaces {
+		if !ni.Enabled {
+			updateBody.Delete = append(updateBody.Delete, key)
+		}
+	}
+
+	for i := len(updateBody.NetworkInterfaces); i < maxNetworkInterfaces; i++ {
+		updateBody.Delete = append(updateBody.Delete, fmt.Sprintf("net%d", i))
+	}
+
+	operatingSystem := d.Get(mkOperatingSystem).([]any)
+
+	if len(operatingSystem) > 0 && operatingSystem[0] != nil {
+		operatingSystemBlock := operatingSystem[0].(map[string]any)
+
+		operatingSystemTemplateFileID := operatingSystemBlock[mkOperatingSystemTemplateFileID].(string)
+		operatingSystemType := operatingSystemBlock[mkOperatingSystemType].(string)
+
+		updateBody.OSTemplateFileVolume = &operatingSystemTemplateFileID
+		updateBody.OSType = &operatingSystemType
+	}
+
+	if len(tags) > 0 {
+		tagString := containerGetTagsString(d)
+		updateBody.Tags = &tagString
+	}
+
+	// Handle mount points for cloned containers
+	mountPoint := d.Get(mkMountPoint).([]any)
+	if len(mountPoint) > 0 {
+		mountPointsMap, err := containerGetMountPointsMap(mountPoint)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		updateBody.MountPoints = mountPointsMap
+	}
+
+	template := d.Get(mkTemplate).(bool)
+	templateAttr := types.CustomBool(template)
+
+	if template {
+		updateBody.Template = &templateAttr
+	}
+
+	err = containerAPI.UpdateContainer(ctx, updateBody)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// Wait for the container's lock to be released.
+	err = containerAPI.WaitForContainerConfigUnlock(ctx, true)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// This must happen after the lock is released to avoid PVE overwriting the config file.
+	if len(idmaps) > 0 {
+		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	return append(diags, containerCreateStart(ctx, d, m)...)
+}
+
+func containerCreateCustom(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	createTimeoutSec := d.Get(mkTimeoutCreate).(int)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(createTimeoutSec)*time.Second)
+	defer cancel()
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	vmIDUntyped, hasVMID := d.GetOk(mkVMID)
+	vmID := vmIDUntyped.(int)
+
+	if !hasVMID {
+		vmIDNew, err := config.GetIDGenerator().NextID(ctx)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		vmID = vmIDNew
+
+		err = d.Set(mkVMID, vmID)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+	container := Container()
+
+	consoleBlock, err := structure.GetSchemaBlock(
+		container,
+		d,
+		[]string{mkConsole},
+		0,
+		true,
+	)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	consoleEnabled := types.CustomBool(
+		consoleBlock[mkConsoleEnabled].(bool),
+	)
+	consoleMode := consoleBlock[mkConsoleMode].(string)
+	consoleTTYCount := consoleBlock[mkConsoleTTYCount].(int)
+
+	cpuBlock, err := structure.GetSchemaBlock(
+		container,
+		d,
+		[]string{mkCPU},
+		0,
+		true,
+	)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	cpuArchitecture := cpuBlock[mkCPUArchitecture].(string)
+	cpuCores := cpuBlock[mkCPUCores].(int)
+	cpuLimit := cpuBlock[mkCPULimit].(float64)
+	cpuUnits := cpuBlock[mkCPUUnits].(int)
+
+	description := d.Get(mkDescription).(string)
+
+	diskBlock, err := structure.GetSchemaBlock(
+		container,
+		d,
+		[]string{mkDisk},
+		0,
+		true,
+	)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	diskDatastoreID := diskBlock[mkDiskDatastoreID].(string)
+
+	environmentVariables := containerGetEnvironmentVariables(d)
+
+	features, err := containerGetFeatures(container, d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	hookScript := d.Get(mkHookScriptFileID).(string)
+
+	initialization := d.Get(mkInitialization).([]any)
+	initializationDNSDomain := dvInitializationDNSDomain
+	initializationDNSServer := dvInitializationDNSServer
+	initializationHostname := dvInitializationHostname
+
+	var initializationIPConfigIPv4Address []string
+
+	var initializationIPConfigIPv4Gateway []string
+
+	var initializationIPConfigIPv6Address []string
+
+	var initializationIPConfigIPv6Gateway []string
+
+	initializationUserAccountKeys := containers.CustomSSHKeys{}
+	initializationUserAccountPassword := dvInitializationUserAccountPassword
+	initializationEntrypoint := dvInitializationEntrypoint
+
+	if len(initialization) > 0 && initialization[0] != nil {
+		initializationBlock := initialization[0].(map[string]any)
+		initializationDNS := initializationBlock[mkInitializationDNS].([]any)
+
+		if len(initializationDNS) > 0 && initializationDNS[0] != nil {
+			initializationDNSBlock := initializationDNS[0].(map[string]any)
+			initializationDNSDomain = initializationDNSBlock[mkInitializationDNSDomain].(string)
+
+			servers := initializationDNSBlock[mkInitializationDNSServers].([]any)
+			deprecatedServer := initializationDNSBlock[mkInitializationDNSServer].(string)
+
+			if len(servers) > 0 {
+				nameserver := strings.Join(utils.ConvertToStringSlice(servers), " ")
+
+				initializationDNSServer = nameserver
+			} else {
+				initializationDNSServer = deprecatedServer
+			}
+		}
+
+		initializationHostname = initializationBlock[mkInitializationHostname].(string)
+		initializationIPConfig := initializationBlock[mkInitializationIPConfig].([]any)
+
+		for _, c := range initializationIPConfig {
+			if c == nil {
+				continue
+			}
+
+			configBlock := c.(map[string]any)
+			ipv4 := configBlock[mkInitializationIPConfigIPv4].([]any)
+
+			if len(ipv4) > 0 && ipv4[0] != nil {
+				ipv4Block := ipv4[0].(map[string]any)
+
+				initializationIPConfigIPv4Address = append(
+					initializationIPConfigIPv4Address,
+					ipv4Block[mkInitializationIPConfigIPv4Address].(string),
+				)
+
+				initializationIPConfigIPv4Gateway = append(
+					initializationIPConfigIPv4Gateway,
+					ipv4Block[mkInitializationIPConfigIPv4Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv4Address = append(initializationIPConfigIPv4Address, "")
+				initializationIPConfigIPv4Gateway = append(initializationIPConfigIPv4Gateway, "")
+			}
+
+			ipv6 := configBlock[mkInitializationIPConfigIPv6].([]any)
+
+			if len(ipv6) > 0 && ipv6[0] != nil {
+				ipv6Block := ipv6[0].(map[string]any)
+
+				initializationIPConfigIPv6Address = append(
+					initializationIPConfigIPv6Address,
+					ipv6Block[mkInitializationIPConfigIPv6Address].(string),
+				)
+
+				initializationIPConfigIPv6Gateway = append(
+					initializationIPConfigIPv6Gateway,
+					ipv6Block[mkInitializationIPConfigIPv6Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv6Address = append(initializationIPConfigIPv6Address, "")
+				initializationIPConfigIPv6Gateway = append(initializationIPConfigIPv6Gateway, "")
+			}
+		}
+
+		initializationUserAccount := initializationBlock[mkInitializationUserAccount].([]any)
+
+		if len(initializationUserAccount) > 0 && initializationUserAccount[0] != nil {
+			initializationUserAccountBlock := initializationUserAccount[0].(map[string]any)
+
+			keys := initializationUserAccountBlock[mkInitializationUserAccountKeys].([]any)
+			initializationUserAccountKeys = make(
+				containers.CustomSSHKeys,
+				len(keys),
+			)
+
+			for ki, kv := range keys {
+				initializationUserAccountKeys[ki] = kv.(string)
+			}
+
+			initializationUserAccountPassword = initializationUserAccountBlock[mkInitializationUserAccountPassword].(string)
+		}
+
+		initializationEntrypoint = initializationBlock[mkInitializationEntrypoint].(string)
+	}
+
+	memoryBlock, err := structure.GetSchemaBlock(
+		container,
+		d,
+		[]string{mkMemory},
+		0,
+		true,
+	)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	memoryDedicated := memoryBlock[mkMemoryDedicated].(int)
+	memorySwap := memoryBlock[mkMemorySwap].(int)
+
+	mountPoint := d.Get(mkMountPoint).([]any)
+	mountPoints := make(containers.CustomMountPoints, len(mountPoint))
+
+	// because of default bool values:
+
+	for mi, mp := range mountPoint {
+		mountPointMap := mp.(map[string]any)
+		mountPointObject := containers.CustomMountPoint{}
+
+		acl := types.CustomBool(mountPointMap[mkMountPointACL].(bool))
+		backup := types.CustomBool(mountPointMap[mkMountPointBackup].(bool))
+		mountOptions := mountPointMap[mkMountPointMountOptions].([]any)
+		path := mountPointMap[mkMountPointPath].(string)
+		quota := types.CustomBool(mountPointMap[mkMountPointQuota].(bool))
+		readOnly := types.CustomBool(mountPointMap[mkMountPointReadOnly].(bool))
+		replicate := types.CustomBool(mountPointMap[mkMountPointReplicate].(bool))
+		shared := types.CustomBool(mountPointMap[mkMountPointShared].(bool))
+		size := mountPointMap[mkMountPointSize].(string)
+		volume := mountPointMap[mkMountPointVolume].(string)
+
+		// we have to set only the values that are different from the provider's defaults,
+		if acl {
+			mountPointObject.ACL = &acl
+		}
+
+		if backup {
+			mountPointObject.Backup = &backup
+		}
+
+		if path != dvMountPointPath {
+			mountPointObject.MountPoint = path
+		}
+
+		if quota {
+			mountPointObject.Quota = &quota
+		}
+
+		if readOnly {
+			mountPointObject.ReadOnly = &readOnly
+		}
+
+		if !replicate {
+			mountPointObject.Replicate = &replicate
+		}
+
+		if shared {
+			mountPointObject.Shared = &shared
+		}
+
+		mountPointObject.Volume = volume
+
+		if len(size) > 0 {
+			ds, err := types.ParseDiskSize(size)
+			if err != nil {
+				return diag.Errorf("invalid disk size: %s", err.Error())
+			}
+
+			parts := strings.SplitN(volume, ":", 2)
+			isExistingVolume := len(parts) == 2 && parts[1] != ""
+
+			if !isExistingVolume {
+				datastore := parts[0]
+				mountPointObject.Volume = fmt.Sprintf("%s:%d", datastore, ds.InGigabytes())
+			} else {
+				dsStr := ds.String()
+				mountPointObject.DiskSize = &dsStr
+			}
+		}
+
+		if len(mountOptions) > 0 {
+			mountOptionsArray := make([]string, 0, len(mountPoint))
+
+			for _, option := range mountOptions {
+				mountOptionsArray = append(mountOptionsArray, option.(string))
+			}
+
+			mountPointObject.MountOptions = &mountOptionsArray
+		}
+
+		mountPoints[fmt.Sprintf("mp%d", mi)] = &mountPointObject
+	}
+
+	var rootFS *containers.CustomRootFS
+
+	var diskMountOptions []string
+
+	if diskBlock[mkDiskMountOptions] != nil {
+		for _, opt := range diskBlock[mkDiskMountOptions].([]any) {
+			diskMountOptions = append(diskMountOptions, opt.(string))
+		}
+	}
+
+	diskACL := types.CustomBool(diskBlock[mkDiskACL].(bool))
+	diskQuota := types.CustomBool(diskBlock[mkDiskQuota].(bool))
+	diskReplicate := types.CustomBool(diskBlock[mkDiskReplicate].(bool))
+	diskSize := diskBlock[mkDiskSize].(int)
+
+	if diskDatastoreID != "" && (diskSize != dvDiskSize ||
+		len(mountPoints) > 0 ||
+		len(diskMountOptions) > 0 ||
+		bool(diskACL) ||
+		bool(diskQuota) ||
+		bool(diskReplicate)) {
+		// This is a special case where the rootfs size is set to a non-default value at creation time.
+		// see https://pve.proxmox.com/pve-docs/chapter-pct.html#_storage_backed_mount_points
+		rootFS = &containers.CustomRootFS{
+			Volume:       fmt.Sprintf("%s:%d", diskDatastoreID, diskSize),
+			MountOptions: &diskMountOptions,
+		}
+
+		// Only emit non-default values, matching the mount-point block convention above.
+		if diskACL {
+			rootFS.ACL = &diskACL
+		}
+
+		if diskQuota {
+			rootFS.Quota = &diskQuota
+		}
+
+		if diskReplicate {
+			rootFS.Replicate = &diskReplicate
+		}
+	}
+
+	networkInterface := d.Get(mkNetworkInterface).([]any)
+	networkInterfaces := make(containers.CustomNetworkInterfaces, len(networkInterface))
+
+	hostManagedSupported := supportContainerHostManaged(ctx, client)
+
+	for ni, nv := range networkInterface {
+		networkInterfaceMap := nv.(map[string]any)
+		networkInterfaceObject := containers.CustomNetworkInterface{}
+
+		bridge := networkInterfaceMap[mkNetworkInterfaceBridge].(string)
+		enabled := networkInterfaceMap[mkNetworkInterfaceEnabled].(bool)
+		macAddress := networkInterfaceMap[mkNetworkInterfaceMACAddress].(string)
+		name := networkInterfaceMap[mkNetworkInterfaceName].(string)
+		rateLimit := networkInterfaceMap[mkNetworkInterfaceRateLimit].(float64)
+		vlanID := networkInterfaceMap[mkNetworkInterfaceVLANID].(int)
+		mtu := networkInterfaceMap[mkNetworkInterfaceMTU].(int)
+		firewall := networkInterfaceMap[mkNetworkInterfaceFirewall].(bool)
+		hostManaged := networkInterfaceMap[mkNetworkInterfaceHostManaged].(bool)
+
+		if bridge != "" {
+			networkInterfaceObject.Bridge = &bridge
+		}
+
+		networkInterfaceObject.Enabled = enabled
+		networkInterfaceObject.Name = name
+
+		if len(initializationIPConfigIPv4Address) > ni {
+			if initializationIPConfigIPv4Address[ni] != "" {
+				networkInterfaceObject.IPv4Address = &initializationIPConfigIPv4Address[ni]
+			}
+
+			if initializationIPConfigIPv4Gateway[ni] != "" {
+				networkInterfaceObject.IPv4Gateway = &initializationIPConfigIPv4Gateway[ni]
+			}
+
+			if initializationIPConfigIPv6Address[ni] != "" {
+				networkInterfaceObject.IPv6Address = &initializationIPConfigIPv6Address[ni]
+			}
+
+			if initializationIPConfigIPv6Gateway[ni] != "" {
+				networkInterfaceObject.IPv6Gateway = &initializationIPConfigIPv6Gateway[ni]
+			}
+		}
+
+		if firewall {
+			networkInterfaceObject.Firewall = types.CustomBool(firewall).Pointer()
+		}
+
+		if hostManagedSupported || hostManaged {
+			networkInterfaceObject.HostManaged = types.CustomBool(hostManaged).Pointer()
+		}
+
+		if macAddress != "" {
+			networkInterfaceObject.MACAddress = &macAddress
+		}
+
+		if rateLimit != 0 {
+			networkInterfaceObject.RateLimit = &rateLimit
+		}
+
+		if vlanID != 0 {
+			networkInterfaceObject.Tag = &vlanID
+		}
+
+		if mtu != 0 {
+			networkInterfaceObject.MTU = &mtu
+		}
+
+		networkInterfaces[fmt.Sprintf("net%d", ni)] = &networkInterfaceObject
+	}
+
+	devicePassthrough := d.Get(mkDevicePassthrough).([]any)
+
+	passthroughDevices := make(
+		containers.CustomPassthroughDevices,
+		len(devicePassthrough),
+	)
+
+	for di, dv := range devicePassthrough {
+		devicePassthroughMap := dv.(map[string]any)
+		devicePassthroughObject := containers.CustomPassthroughDevice{}
+
+		denyWrite := types.CustomBool(
+			devicePassthroughMap[mkDevicePassthroughDenyWrite].(bool),
+		)
+		gid := devicePassthroughMap[mkDevicePassthroughGID].(int)
+		mode := devicePassthroughMap[mkDevicePassthroughMode].(string)
+		path := devicePassthroughMap[mkDevicePassthroughPath].(string)
+		uid := devicePassthroughMap[mkDevicePassthroughUID].(int)
+
+		devicePassthroughObject.DenyWrite = &denyWrite
+		devicePassthroughObject.GID = &gid
+		devicePassthroughObject.Mode = &mode
+		devicePassthroughObject.Path = path
+		devicePassthroughObject.UID = &uid
+
+		passthroughDevices[fmt.Sprintf("dev%d", di)] = &devicePassthroughObject
+	}
+
+	idmaps := containerGetIDMaps(d.Get(mkIDMap).([]any))
+
+	operatingSystem := d.Get(mkOperatingSystem).([]any)
+
+	if len(operatingSystem) == 0 || operatingSystem[0] == nil {
+		return diag.Errorf(
+			"\"%s\": required field is not set",
+			mkOperatingSystem,
+		)
+	}
+
+	operatingSystemBlock := operatingSystem[0].(map[string]any)
+	operatingSystemTemplateFileID := operatingSystemBlock[mkOperatingSystemTemplateFileID].(string)
+	operatingSystemType := operatingSystemBlock[mkOperatingSystemType].(string)
+
+	poolID := d.Get(mkPoolID).(string)
+	protection := types.CustomBool(d.Get(mkProtection).(bool))
+	started := types.CustomBool(d.Get(mkStarted).(bool))
+	startOnBoot := types.CustomBool(d.Get(mkStartOnBoot).(bool))
+	startupBehavior := containerGetStartupBehavior(d)
+	tags := d.Get(mkTags).([]any)
+	template := types.CustomBool(d.Get(mkTemplate).(bool))
+	unprivileged := types.CustomBool(d.Get(mkUnprivileged).(bool))
+
+	// Attempt to create the container using the retrieved values.
+	createBody := containers.CreateRequestBody{
+		ConsoleEnabled:       &consoleEnabled,
+		ConsoleMode:          &consoleMode,
+		CPUArchitecture:      &cpuArchitecture,
+		CPUCores:             &cpuCores,
+		CPULimit:             &cpuLimit,
+		DatastoreID:          &diskDatastoreID,
+		DedicatedMemory:      &memoryDedicated,
+		PassthroughDevices:   passthroughDevices,
+		Features:             features,
+		MountPoints:          mountPoints,
+		NetworkInterfaces:    networkInterfaces,
+		OSTemplateFileVolume: &operatingSystemTemplateFileID,
+		OSType:               &operatingSystemType,
+		Protection:           &protection,
+		RootFS:               rootFS,
+		Start:                &started,
+		StartOnBoot:          &startOnBoot,
+		StartupBehavior:      startupBehavior,
+		Swap:                 &memorySwap,
+		Template:             &template,
+		TTY:                  &consoleTTYCount,
+		Unprivileged:         &unprivileged,
+		VMID:                 &vmID,
+	}
+
+	if cpuUnits > 0 {
+		createBody.CPUUnits = &cpuUnits
+	}
+
+	if description != "" {
+		createBody.Description = &description
+	}
+
+	if hookScript != "" {
+		createBody.HookScript = &hookScript
+	}
+
+	if initializationDNSDomain != "" {
+		createBody.DNSDomain = &initializationDNSDomain
+	}
+
+	if initializationDNSServer != "" {
+		createBody.DNSServer = &initializationDNSServer
+	}
+
+	if initializationHostname != "" {
+		createBody.Hostname = &initializationHostname
+	}
+
+	if len(initializationUserAccountKeys) > 0 {
+		createBody.SSHKeys = &initializationUserAccountKeys
+	}
+
+	if initializationUserAccountPassword != "" {
+		createBody.Password = &initializationUserAccountPassword
+	}
+
+	if initializationEntrypoint != "" {
+		createBody.Entrypoint = &initializationEntrypoint
+	}
+
+	if poolID != "" {
+		createBody.PoolID = &poolID
+	}
+
+	if len(tags) > 0 {
+		tagsString := containerGetTagsString(d)
+		createBody.Tags = &tagsString
+	}
+
+	if environmentVariables != nil {
+		createBody.EnvironmentVariables = environmentVariables
+	}
+
+	createResult := client.Node(nodeName).Container(0).CreateContainer(ctx, &createBody)
+
+	diags := sdkresource.TaskResultDiags(createResult, "Container create")
+	if diags.HasError() {
+		return diags
+	}
+
+	d.SetId(strconv.Itoa(vmID))
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Wait for the container's lock to be released before modifying the config file.
+	err = containerAPI.WaitForContainerConfigUnlock(ctx, true)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// This must happen after the lock is released to avoid PVE overwriting the config file.
+	if len(idmaps) > 0 {
+		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	return append(diags, containerCreateStart(ctx, d, m)...)
+}
+
+func containerCreateStart(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	started := d.Get(mkStarted).(bool)
+	template := d.Get(mkTemplate).(bool)
+
+	if !started || template {
+		return containerRead(ctx, d, m)
+	}
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+
+	vmID, err := strconv.Atoi(d.Id())
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Start the container and wait for it to reach a running state before continuing.
+	diags := sdkresource.TaskResultDiags(containerAPI.StartContainer(ctx), "Container start")
+	if diags.HasError() {
+		return diags
+	}
+
+	// idmap is written to the config via SSH after create, but PVE's first start does not apply
+	// it; a reboot regenerates the runtime mapping. Mirrors the rebootRequired path in update.
+	if len(containerGetIDMaps(d.Get(mkIDMap).([]any))) > 0 {
+		rebootTimeoutSec := d.Get(mkTimeoutCreate).(int)
+
+		rebootDiags := sdkresource.TaskResultDiags(containerAPI.RebootContainer(
+			ctx,
+			&containers.RebootRequestBody{
+				Timeout: &rebootTimeoutSec,
+			},
+		), "Container reboot")
+		if rebootDiags.HasError() {
+			return append(diags, rebootDiags...)
+		}
+
+		diags = append(diags, rebootDiags...)
+	}
+
+	return append(diags, containerRead(ctx, d, m)...)
+}
+
+// supportContainerHostManaged probes the cluster version to gate the host-managed flag (PVE 9.1+).
+// On older releases callers must elide host-managed=0 because the API rejects the unknown sub-key.
+func supportContainerHostManaged(ctx context.Context, client proxmox.Client) bool {
+	ver := version.MinimumProxmoxVersion
+	if versionResp, err := client.Version().Version(ctx); err == nil {
+		ver = versionResp.Version
+	}
+
+	return ver.SupportContainerHostManaged()
+}
+
+func containerGetEnvironmentVariables(d *schema.ResourceData) *containers.CustomEnvironmentVariables {
+	envVarsRaw := d.Get(mkEnvironmentVariables).(map[string]any)
+	if len(envVarsRaw) == 0 {
+		return nil
+	}
+
+	envVars := make(containers.CustomEnvironmentVariables)
+	for k, v := range envVarsRaw {
+		envVars[k] = v.(string)
+	}
+
+	return &envVars
+}
+
+// NOTE: this function is NOT used in `read`!
+func containerGetExistingNetworkInterface(
+	ctx context.Context,
+	containerAPI *containers.Client,
+) ([]any, error) {
+	containerInfo, err := containerAPI.GetContainer(ctx)
+	if err != nil {
+		return []any{}, fmt.Errorf("error getting container information: %w", err)
+	}
+
+	networkInterfacesMap := make(map[string]any, len(containerInfo.NetworkInterfaces))
+
+	for key, nv := range containerInfo.NetworkInterfaces {
+		networkInterface := map[string]any{}
+
+		networkInterface[mkNetworkInterfaceEnabled] = true
+		networkInterface[mkNetworkInterfaceName] = nv.Name // "eth0", "eth1", etc, same as the `key`
+
+		if nv.Bridge != nil {
+			networkInterface[mkNetworkInterfaceBridge] = *nv.Bridge
+		} else {
+			networkInterface[mkNetworkInterfaceBridge] = ""
+		}
+
+		if nv.Firewall != nil && *nv.Firewall {
+			networkInterface[mkNetworkInterfaceFirewall] = true
+		} else {
+			networkInterface[mkNetworkInterfaceFirewall] = false
+		}
+
+		if nv.HostManaged != nil && *nv.HostManaged {
+			networkInterface[mkNetworkInterfaceHostManaged] = true
+		} else {
+			networkInterface[mkNetworkInterfaceHostManaged] = false
+		}
+
+		if nv.MACAddress != nil {
+			networkInterface[mkNetworkInterfaceMACAddress] = *nv.MACAddress
+		} else {
+			networkInterface[mkNetworkInterfaceMACAddress] = ""
+		}
+
+		if nv.RateLimit != nil {
+			networkInterface[mkNetworkInterfaceRateLimit] = *nv.RateLimit
+		} else {
+			networkInterface[mkNetworkInterfaceRateLimit] = float64(0)
+		}
+
+		if nv.Tag != nil {
+			networkInterface[mkNetworkInterfaceVLANID] = *nv.Tag
+		} else {
+			networkInterface[mkNetworkInterfaceVLANID] = 0
+		}
+
+		if nv.MTU != nil {
+			networkInterface[mkNetworkInterfaceMTU] = *nv.MTU
+		} else {
+			networkInterface[mkNetworkInterfaceMTU] = 0
+		}
+
+		networkInterfacesMap[key] = networkInterface
+	}
+
+	return utils.OrderedListFromMap(networkInterfacesMap), nil
+}
+
+func containerGetTagsString(d *schema.ResourceData) string {
+	var sanitizedTags []string
+
+	tags := d.Get(mkTags).([]any)
+	for _, tag := range tags {
+		sanitizedTag := strings.TrimSpace(tag.(string))
+		if len(sanitizedTag) > 0 {
+			sanitizedTags = append(sanitizedTags, sanitizedTag)
+		}
+	}
+
+	sort.Strings(sanitizedTags)
+
+	return strings.Join(sanitizedTags, ";")
+}
+
+func containerGetMountPointsMap(mountPoint []any) (containers.CustomMountPoints, error) {
+	mountPointsMap := make(containers.CustomMountPoints, len(mountPoint))
+
+	for i, mp := range mountPoint {
+		mountPointMap := mp.(map[string]any)
+		mountPointObject := containers.CustomMountPoint{}
+
+		acl := types.CustomBool(mountPointMap[mkMountPointACL].(bool))
+		backup := types.CustomBool(mountPointMap[mkMountPointBackup].(bool))
+		mountOptions := mountPointMap[mkMountPointMountOptions].([]any)
+		path := mountPointMap[mkMountPointPath].(string)
+		quota := types.CustomBool(mountPointMap[mkMountPointQuota].(bool))
+		readOnly := types.CustomBool(mountPointMap[mkMountPointReadOnly].(bool))
+		replicate := types.CustomBool(mountPointMap[mkMountPointReplicate].(bool))
+		shared := types.CustomBool(mountPointMap[mkMountPointShared].(bool))
+		size := mountPointMap[mkMountPointSize].(string)
+		volume := mountPointMap[mkMountPointVolume].(string)
+
+		mountPointObject.ACL = &acl
+		mountPointObject.Backup = &backup
+		mountPointObject.MountPoint = path
+		mountPointObject.Quota = &quota
+		mountPointObject.ReadOnly = &readOnly
+		mountPointObject.Replicate = &replicate
+		mountPointObject.Shared = &shared
+		mountPointObject.Volume = volume
+
+		if len(size) > 0 {
+			ds, err := types.ParseDiskSize(size)
+			if err != nil {
+				return nil, fmt.Errorf("invalid disk size: %w", err)
+			}
+
+			parts := strings.SplitN(volume, ":", 2)
+			isExistingVolume := len(parts) == 2 && parts[1] != ""
+
+			if !isExistingVolume {
+				datastore := parts[0]
+				mountPointObject.Volume = fmt.Sprintf("%s:%d", datastore, ds.InGigabytes())
+			} else {
+				dsStr := ds.String()
+				mountPointObject.DiskSize = &dsStr
+			}
+		}
+
+		if len(mountOptions) > 0 {
+			mountOptionsArray := make([]string, 0, len(mountOptions))
+
+			for _, option := range mountOptions {
+				mountOptionsArray = append(mountOptionsArray, option.(string))
+			}
+
+			mountPointObject.MountOptions = &mountOptionsArray
+		}
+
+		mountPointsMap[fmt.Sprintf("mp%d", i)] = &mountPointObject
+	}
+
+	return mountPointsMap, nil
+}
+
+func containerGetStartupBehavior(d *schema.ResourceData) *containers.CustomStartupBehavior {
+	startup := d.Get(mkStartup).([]any)
+	if len(startup) > 0 && startup[0] != nil {
+		startupBlock := startup[0].(map[string]any)
+		startupOrder := startupBlock[mkStartupOrder].(int)
+		startupUpDelay := startupBlock[mkStartupUpDelay].(int)
+		startupDownDelay := startupBlock[mkStartupDownDelay].(int)
+
+		order := containers.CustomStartupBehavior{}
+
+		if startupUpDelay >= 0 {
+			order.Up = &startupUpDelay
+		}
+
+		if startupDownDelay >= 0 {
+			order.Down = &startupDownDelay
+		}
+
+		if startupOrder >= 0 {
+			order.Order = &startupOrder
+		}
+
+		return &order
+	}
+
+	return nil
+}
+
+func containerGetFeatures(resource *schema.Resource, d *schema.ResourceData) (*containers.CustomFeatures, error) {
+	return containerGetFeaturesInternal(resource, d, false)
+}
+
+// Always populates all bool flags so a true→false toggle reaches PVE instead of
+// being dropped by EncodeValues' nil-pointer skip.
+func containerGetFeaturesForUpdate(resource *schema.Resource, d *schema.ResourceData) (*containers.CustomFeatures, error) {
+	return containerGetFeaturesInternal(resource, d, true)
+}
+
+func containerGetFeaturesInternal(
+	resource *schema.Resource,
+	d *schema.ResourceData,
+	emitFalseBools bool,
+) (*containers.CustomFeatures, error) {
+	featuresBlock, err := structure.GetSchemaBlock(
+		resource,
+		d,
+		[]string{mkFeatures},
+		0,
+		true,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error getting container features from schema: %w", err)
+	}
+
+	nesting := types.CustomBool(featuresBlock[mkFeaturesNesting].(bool))
+	keyctl := types.CustomBool(featuresBlock[mkFeaturesKeyControl].(bool))
+	fuse := types.CustomBool(featuresBlock[mkFeaturesFUSE].(bool))
+	mountTypes := featuresBlock[mkFeaturesMountTypes].([]any)
+	mknod := types.CustomBool(featuresBlock[mkFeaturesMakeDeviceNode].(bool))
+
+	var mountTypesConverted []string
+	if mountTypes != nil {
+		mountTypesConverted = make([]string, len(mountTypes))
+		for i, mountType := range mountTypes {
+			mountTypesConverted[i] = mountType.(string)
+		}
+	} else {
+		mountTypesConverted = []string{}
+	}
+
+	features := containers.CustomFeatures{
+		MountTypes: &mountTypesConverted,
+	}
+
+	if bool(nesting) || emitFalseBools {
+		features.Nesting = &nesting
+	}
+
+	if bool(keyctl) || emitFalseBools {
+		features.KeyControl = &keyctl
+	}
+
+	if bool(fuse) || emitFalseBools {
+		features.FUSE = &fuse
+	}
+
+	if bool(mknod) || emitFalseBools {
+		features.MakeDeviceNode = &mknod
+	}
+
+	return &features, nil
+}
+
+func containerGetIDMaps(list []any) []containers.CustomIDMapEntry {
+	idmaps := make([]containers.CustomIDMapEntry, len(list))
+
+	for i, entry := range list {
+		entryMap := entry.(map[string]any)
+		idmaps[i] = containers.CustomIDMapEntry{
+			Type:        entryMap[mkIDMapType].(string),
+			ContainerID: entryMap[mkIDMapContainerID].(int),
+			HostID:      entryMap[mkIDMapHostID].(int),
+			Size:        entryMap[mkIDMapSize].(int),
+		}
+	}
+
+	return idmaps
+}
+
+func containerSetIDMaps(
+	ctx context.Context,
+	client proxmox.Client,
+	nodeName string,
+	vmID int,
+	idmaps []containers.CustomIDMapEntry,
+) error {
+	configFile := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmID)
+
+	commands := []string{
+		`set -e`,
+		ssh.TrySudo,
+		fmt.Sprintf(`try_sudo sed -i '/^lxc\.idmap:/d' %s`, configFile),
+	}
+
+	if len(idmaps) > 0 {
+		lines := make([]string, 0, len(idmaps))
+
+		for _, entry := range idmaps {
+			typeChar := "u"
+			if entry.Type == "gid" {
+				typeChar = "g"
+			}
+
+			lines = append(lines, fmt.Sprintf("lxc.idmap: %s %d %d %d", typeChar, entry.ContainerID, entry.HostID, entry.Size))
+		}
+
+		commands = append(commands,
+			fmt.Sprintf(`echo '%s' | try_sudo tee -a %s > /dev/null`, strings.Join(lines, "\n"), configFile))
+	}
+
+	_, err := client.SSH().ExecuteNodeCommands(ctx, nodeName, commands)
+	if err != nil {
+		return fmt.Errorf("setting idmap entries via SSH: %w", err)
+	}
+
+	return nil
+}
+
+func containerRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, e := config.GetClient()
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+
+	vmID, e := strconv.Atoi(d.Id())
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Retrieve the entire configuration in order to compare it to the state.
+	containerConfig, e := containerAPI.GetContainer(ctx)
+	if e != nil {
+		if errors.Is(e, api.ErrResourceDoesNotExist) {
+			d.SetId("")
+
+			return nil
+		}
+
+		return diag.FromErr(e)
+	}
+
+	// Fix terraform.tfstate, by replacing '-1' (the old default value) with actual vm_id value
+	if storedVMID := d.Get(mkVMID).(int); storedVMID == -1 {
+		diags = append(diags, diag.Diagnostic{
+			Severity: diag.Warning,
+			Summary: fmt.Sprintf("VM %s has stored legacy vm_id %d, setting vm_id to its correct value %d.",
+				d.Id(), storedVMID, vmID),
+		})
+
+		err := d.Set(mkVMID, vmID)
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	clone := d.Get(mkClone).([]any)
+
+	// Compare the primitive values to those stored in the state.
+	currentDescription := d.Get(mkDescription).(string)
+
+	if len(clone) == 0 || currentDescription != dvDescription {
+		if containerConfig.Description != nil {
+			e = d.Set(mkDescription, *containerConfig.Description)
+		} else {
+			e = d.Set(mkDescription, "")
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	// Compare the console configuration to the one stored in the state.
+	console := map[string]any{}
+
+	if containerConfig.ConsoleEnabled != nil {
+		console[mkConsoleEnabled] = *containerConfig.ConsoleEnabled
+	} else {
+		// Default value of "console" is "1" according to the API documentation.
+		console[mkConsoleEnabled] = true
+	}
+
+	if containerConfig.ConsoleMode != nil {
+		console[mkConsoleMode] = *containerConfig.ConsoleMode
+	} else {
+		// Default value of "cmode" is "tty" according to the API documentation.
+		console[mkConsoleMode] = "tty"
+	}
+
+	if containerConfig.TTY != nil {
+		console[mkConsoleTTYCount] = *containerConfig.TTY
+	} else {
+		// Default value of "tty" is "2" according to the API documentation.
+		console[mkConsoleTTYCount] = 2
+	}
+
+	currentConsole := d.Get(mkConsole).([]any)
+
+	if len(clone) > 0 {
+		if len(currentConsole) > 0 {
+			err := d.Set(mkConsole, []any{console})
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentConsole) > 0 ||
+		console[mkConsoleEnabled] != types.CustomBool(dvConsoleEnabled) ||
+		console[mkConsoleMode] != dvConsoleMode ||
+		console[mkConsoleTTYCount] != dvConsoleTTYCount {
+		err := d.Set(mkConsole, []any{console})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the CPU configuration to the one stored in the state.
+	cpu := map[string]any{}
+
+	if containerConfig.CPUArchitecture != nil {
+		cpu[mkCPUArchitecture] = *containerConfig.CPUArchitecture
+	} else {
+		// Default value of "arch" is "amd64" according to the API documentation.
+		cpu[mkCPUArchitecture] = "amd64"
+	}
+
+	if containerConfig.CPUCores != nil {
+		cpu[mkCPUCores] = *containerConfig.CPUCores
+	} else {
+		// Default value of "cores" is "1" according to the API documentation.
+		cpu[mkCPUCores] = 1
+	}
+
+	if containerConfig.CPULimit != nil {
+		cpu[mkCPULimit] = float64(*containerConfig.CPULimit)
+	} else {
+		// Default value of "cpulimit" is "0" according to the API documentation.
+		cpu[mkCPULimit] = float64(0)
+	}
+
+	if containerConfig.CPUUnits != nil {
+		cpu[mkCPUUnits] = *containerConfig.CPUUnits
+	} else {
+		cpu[mkCPUUnits] = 0
+	}
+
+	currentCPU := d.Get(mkCPU).([]any)
+
+	if len(clone) > 0 {
+		if len(currentCPU) > 0 {
+			err := d.Set(mkCPU, []any{cpu})
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentCPU) > 0 ||
+		cpu[mkCPUArchitecture] != dvCPUArchitecture ||
+		cpu[mkCPUCores] != dvCPUCores ||
+		cpu[mkCPULimit] != dvCPULimit ||
+		cpu[mkCPUUnits] != dvCPUUnits {
+		err := d.Set(mkCPU, []any{cpu})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the disk configuration to the one stored in the state.
+	disk := map[string]any{}
+
+	if containerConfig.RootFS != nil {
+		volumeParts := strings.Split(containerConfig.RootFS.Volume, ":")
+		disk[mkDiskACL] = containerConfig.RootFS.ACL
+		disk[mkDiskReplicate] = containerConfig.RootFS.Replicate
+		disk[mkDiskQuota] = containerConfig.RootFS.Quota
+		disk[mkDiskDatastoreID] = volumeParts[0]
+		disk[mkDiskPathInDatastore] = containerConfig.RootFS.Volume
+
+		disk[mkDiskSize] = containerConfig.RootFS.Size.InGigabytes()
+		if containerConfig.RootFS.MountOptions != nil {
+			disk[mkDiskMountOptions] = *containerConfig.RootFS.MountOptions
+		} else {
+			disk[mkDiskMountOptions] = []string{}
+		}
+	} else {
+		// Default value of "storage" is "local" according to the API documentation.
+		disk[mkDiskDatastoreID] = "local"
+		disk[mkDiskSize] = dvDiskSize
+		disk[mkDiskMountOptions] = []string{}
+		disk[mkDiskPathInDatastore] = ""
+	}
+
+	currentDisk := d.Get(mkDisk).([]any)
+
+	if len(clone) > 0 {
+		if len(currentDisk) > 0 && currentDisk[0] != nil {
+			// do not override the rootfs size if it was not changed during the clone operation
+			if currentDisk[0].(map[string]any)[mkDiskSize] == dvDiskSize {
+				disk[mkDiskSize] = dvDiskSize
+			}
+
+			err := d.Set(mkDisk, []any{disk})
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentDisk) > 0 ||
+		disk[mkDiskDatastoreID] != dvDiskDatastoreID ||
+		disk[mkDiskACL] != dvDiskACL ||
+		disk[mkDiskReplicate] != dvDiskReplicate ||
+		disk[mkDiskQuota] != dvDiskQuota ||
+		len(disk[mkDiskMountOptions].([]string)) > 0 {
+		err := d.Set(mkDisk, []any{disk})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the memory configuration to the one stored in the state.
+	memory := map[string]any{}
+
+	if containerConfig.DedicatedMemory != nil {
+		memory[mkMemoryDedicated] = *containerConfig.DedicatedMemory
+	} else {
+		memory[mkMemoryDedicated] = 0
+	}
+
+	if containerConfig.Swap != nil {
+		memory[mkMemorySwap] = *containerConfig.Swap
+	} else {
+		memory[mkMemorySwap] = 0
+	}
+
+	currentMemory := d.Get(mkMemory).([]any)
+
+	if len(clone) > 0 {
+		if len(currentMemory) > 0 {
+			err := d.Set(mkMemory, []any{memory})
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentMemory) > 0 ||
+		memory[mkMemoryDedicated] != dvMemoryDedicated ||
+		memory[mkMemorySwap] != dvMemorySwap {
+		err := d.Set(mkMemory, []any{memory})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the features configuration to the one stored in the state.
+	features := map[string]any{}
+
+	if containerConfig.Features != nil {
+		if containerConfig.Features.Nesting != nil {
+			features[mkFeaturesNesting] = bool(*containerConfig.Features.Nesting)
+		} else {
+			features[mkFeaturesNesting] = dvFeaturesNesting
+		}
+
+		if containerConfig.Features.KeyControl != nil {
+			features[mkFeaturesKeyControl] = bool(*containerConfig.Features.KeyControl)
+		} else {
+			features[mkFeaturesKeyControl] = dvFeaturesKeyControl
+		}
+
+		if containerConfig.Features.FUSE != nil {
+			features[mkFeaturesFUSE] = bool(*containerConfig.Features.FUSE)
+		} else {
+			features[mkFeaturesFUSE] = dvFeaturesFUSE
+		}
+
+		if containerConfig.Features.MountTypes != nil {
+			features[mkFeaturesMountTypes] = *containerConfig.Features.MountTypes
+		} else {
+			features[mkFeaturesMountTypes] = []string{}
+		}
+
+		if containerConfig.Features.MakeDeviceNode != nil {
+			features[mkFeaturesMakeDeviceNode] = bool(*containerConfig.Features.MakeDeviceNode)
+		} else {
+			features[mkFeaturesMakeDeviceNode] = dvFeaturesMakeDeviceNode
+		}
+	} else {
+		features[mkFeaturesNesting] = dvFeaturesNesting
+		features[mkFeaturesKeyControl] = dvFeaturesKeyControl
+		features[mkFeaturesFUSE] = dvFeaturesFUSE
+		features[mkFeaturesMountTypes] = []string{}
+		features[mkFeaturesMakeDeviceNode] = dvFeaturesMakeDeviceNode
+	}
+
+	currentFeatures := d.Get(mkFeatures).([]any)
+
+	if len(clone) > 0 {
+		if len(currentFeatures) > 0 {
+			err := d.Set(mkFeatures, []any{features})
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentFeatures) > 0 ||
+		features[mkFeaturesNesting] != dvFeaturesNesting ||
+		features[mkFeaturesKeyControl] != dvFeaturesKeyControl ||
+		features[mkFeaturesFUSE] != dvFeaturesFUSE ||
+		len(features[mkFeaturesMountTypes].([]string)) > 0 ||
+		features[mkFeaturesMakeDeviceNode] != dvFeaturesMakeDeviceNode {
+		err := d.Set(mkFeatures, []any{features})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the initialization and network interface configuration to the one stored in the state.
+	initialization := map[string]any{}
+
+	if containerConfig.DNSDomain != nil || containerConfig.DNSServer != nil {
+		initializationDNS := map[string]any{}
+
+		if containerConfig.DNSDomain != nil {
+			initializationDNS[mkInitializationDNSDomain] = *containerConfig.DNSDomain
+		} else {
+			initializationDNS[mkInitializationDNSDomain] = ""
+		}
+
+		// check what we have in the plan
+		currentInitializationDNSBlock := map[string]any{}
+		currentInitialization := d.Get(mkInitialization).([]any)
+
+		if len(currentInitialization) > 0 && currentInitialization[0] != nil {
+			currentInitializationBlock := currentInitialization[0].(map[string]any)
+			currentInitializationDNS := currentInitializationBlock[mkInitializationDNS].([]any)
+
+			if len(currentInitializationDNS) > 0 && currentInitializationDNS[0] != nil {
+				currentInitializationDNSBlock = currentInitializationDNS[0].(map[string]any)
+			}
+		}
+
+		currentInitializationDNSServer, ok := currentInitializationDNSBlock[mkInitializationDNSServer]
+		if containerConfig.DNSServer != nil {
+			if ok && currentInitializationDNSServer != "" {
+				initializationDNS[mkInitializationDNSServer] = *containerConfig.DNSServer
+			} else {
+				dnsServer := strings.Split(*containerConfig.DNSServer, " ")
+				initializationDNS[mkInitializationDNSServers] = dnsServer
+			}
+		} else {
+			initializationDNS[mkInitializationDNSServer] = ""
+			initializationDNS[mkInitializationDNSServers] = []string{}
+		}
+
+		initialization[mkInitializationDNS] = []any{
+			initializationDNS,
+		}
+	}
+
+	if containerConfig.Hostname != nil {
+		initialization[mkInitializationHostname] = *containerConfig.Hostname
+	} else {
+		initialization[mkInitializationHostname] = ""
+	}
+
+	if containerConfig.Entrypoint != nil {
+		entrypoint := *containerConfig.Entrypoint
+		initialization[mkInitializationEntrypoint] = entrypoint
+	} else {
+		initialization[mkInitializationEntrypoint] = dvInitializationEntrypoint
+	}
+
+	passthroughDevicesMap := make(map[string]any, len(containerConfig.PassthroughDevices))
+
+	for key, dp := range containerConfig.PassthroughDevices {
+		passthroughDevice := map[string]any{}
+
+		if dp.DenyWrite != nil {
+			passthroughDevice[mkDevicePassthroughDenyWrite] = *dp.DenyWrite
+		} else {
+			passthroughDevice[mkDevicePassthroughDenyWrite] = false
+		}
+
+		if dp.GID != nil {
+			passthroughDevice[mkDevicePassthroughGID] = *dp.GID
+		} else {
+			passthroughDevice[mkDevicePassthroughGID] = 0
+		}
+
+		if dp.Mode != nil {
+			passthroughDevice[mkDevicePassthroughMode] = *dp.Mode
+		} else {
+			passthroughDevice[mkDevicePassthroughMode] = dvDevicePassthroughMode
+		}
+
+		passthroughDevice[mkDevicePassthroughPath] = dp.Path
+
+		if dp.UID != nil {
+			passthroughDevice[mkDevicePassthroughUID] = *dp.UID
+		} else {
+			passthroughDevice[mkDevicePassthroughUID] = 0
+		}
+
+		passthroughDevicesMap[key] = passthroughDevice
+	}
+
+	passthroughDevices := utils.OrderedListFromMap(passthroughDevicesMap)
+	currentPassthroughDevices := d.Get(mkDevicePassthrough).([]any)
+
+	if len(clone) > 0 {
+		if len(currentPassthroughDevices) > 0 {
+			err := d.Set(mkDevicePassthrough, passthroughDevices)
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(passthroughDevicesMap) > 0 {
+		err := d.Set(mkDevicePassthrough, passthroughDevices)
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	idmapList := make([]map[string]any, len(containerConfig.LXCConfig.IDMaps))
+	for i, entry := range containerConfig.LXCConfig.IDMaps {
+		idmapList[i] = map[string]any{
+			mkIDMapType:        entry.Type,
+			mkIDMapContainerID: entry.ContainerID,
+			mkIDMapHostID:      entry.HostID,
+			mkIDMapSize:        entry.Size,
+		}
+	}
+
+	err := d.Set(mkIDMap, idmapList)
+	diags = append(diags, diag.FromErr(err)...)
+
+	mountPointsMap := make(map[string]any, len(containerConfig.MountPoints))
+
+	for key, mp := range containerConfig.MountPoints {
+		mountPoint := map[string]any{}
+
+		if mp.ACL != nil {
+			mountPoint[mkMountPointACL] = *mp.ACL
+		} else {
+			mountPoint[mkMountPointACL] = false
+		}
+
+		if mp.Backup != nil {
+			mountPoint[mkMountPointBackup] = *mp.Backup
+		} else {
+			mountPoint[mkMountPointBackup] = dvMountPointBackup
+		}
+
+		if mp.MountOptions != nil {
+			mountPoint[mkMountPointMountOptions] = *mp.MountOptions
+		} else {
+			mountPoint[mkMountPointMountOptions] = []string{}
+		}
+
+		mountPoint[mkMountPointPath] = mp.MountPoint
+
+		if mp.Quota != nil {
+			mountPoint[mkMountPointQuota] = *mp.Quota
+		} else {
+			mountPoint[mkMountPointQuota] = false
+		}
+
+		if mp.ReadOnly != nil {
+			mountPoint[mkMountPointReadOnly] = *mp.ReadOnly
+		} else {
+			mountPoint[mkMountPointReadOnly] = false
+		}
+
+		if mp.Replicate != nil {
+			mountPoint[mkMountPointReplicate] = *mp.Replicate
+		} else {
+			mountPoint[mkMountPointReplicate] = true
+		}
+
+		if mp.Shared != nil {
+			mountPoint[mkMountPointShared] = *mp.Shared
+		} else {
+			mountPoint[mkMountPointShared] = false
+		}
+
+		if mp.DiskSize != nil {
+			mountPoint[mkMountPointSize] = *mp.DiskSize
+		} else {
+			mountPoint[mkMountPointSize] = ""
+		}
+
+		mountPoint[mkMountPointVolume] = mp.Volume
+		mountPoint[mkMountPointPathInDatastore] = mp.Volume
+
+		mountPointsMap[key] = mountPoint
+	}
+
+	mountPoints := utils.OrderedListFromMap(mountPointsMap)
+	currentMountPoints := d.Get(mkMountPoint).([]any)
+
+	if len(clone) > 0 {
+		if len(currentMountPoints) > 0 {
+			err := d.Set(mkMountPoint, mountPoints)
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(mountPointsMap) > 0 {
+		err := d.Set(mkMountPoint, mountPoints)
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	ipConfigMap := make(map[string]any, len(containerConfig.NetworkInterfaces))
+	networkInterfacesMap := make(map[string]any, len(containerConfig.NetworkInterfaces))
+
+	for key, nv := range containerConfig.NetworkInterfaces {
+		if nv.IPv4Address != nil || nv.IPv4Gateway != nil || nv.IPv6Address != nil ||
+			nv.IPv6Gateway != nil {
+			ipConfig := map[string]any{}
+
+			if nv.IPv4Address != nil || nv.IPv4Gateway != nil {
+				ip := map[string]any{}
+
+				if nv.IPv4Address != nil {
+					ip[mkInitializationIPConfigIPv4Address] = *nv.IPv4Address
+				} else {
+					ip[mkInitializationIPConfigIPv4Address] = ""
+				}
+
+				if nv.IPv4Gateway != nil {
+					ip[mkInitializationIPConfigIPv4Gateway] = *nv.IPv4Gateway
+				} else {
+					ip[mkInitializationIPConfigIPv4Gateway] = ""
+				}
+
+				ipConfig[mkInitializationIPConfigIPv4] = []any{ip}
+			} else {
+				ipConfig[mkInitializationIPConfigIPv4] = []any{}
+			}
+
+			if nv.IPv6Address != nil || nv.IPv6Gateway != nil {
+				ip := map[string]any{}
+
+				if nv.IPv6Address != nil {
+					ip[mkInitializationIPConfigIPv6Address] = *nv.IPv6Address
+				} else {
+					ip[mkInitializationIPConfigIPv6Address] = ""
+				}
+
+				if nv.IPv6Gateway != nil {
+					ip[mkInitializationIPConfigIPv6Gateway] = *nv.IPv6Gateway
+				} else {
+					ip[mkInitializationIPConfigIPv6Gateway] = ""
+				}
+
+				ipConfig[mkInitializationIPConfigIPv6] = []any{ip}
+			} else {
+				ipConfig[mkInitializationIPConfigIPv6] = []any{}
+			}
+
+			// there is only one set of IP addresses (IPv4 + IPv6)  per network interface
+			ipConfigMap[key] = ipConfig
+		}
+
+		networkInterface := map[string]any{}
+
+		networkInterface[mkNetworkInterfaceEnabled] = true
+		networkInterface[mkNetworkInterfaceName] = nv.Name
+
+		if nv.Bridge != nil {
+			networkInterface[mkNetworkInterfaceBridge] = *nv.Bridge
+		} else {
+			networkInterface[mkNetworkInterfaceBridge] = ""
+		}
+
+		if nv.Firewall != nil && *nv.Firewall {
+			networkInterface[mkNetworkInterfaceFirewall] = true
+		} else {
+			networkInterface[mkNetworkInterfaceFirewall] = false
+		}
+
+		if nv.HostManaged != nil && *nv.HostManaged {
+			networkInterface[mkNetworkInterfaceHostManaged] = true
+		} else {
+			networkInterface[mkNetworkInterfaceHostManaged] = false
+		}
+
+		if nv.MACAddress != nil {
+			networkInterface[mkNetworkInterfaceMACAddress] = *nv.MACAddress
+		} else {
+			networkInterface[mkNetworkInterfaceMACAddress] = ""
+		}
+
+		if nv.RateLimit != nil {
+			networkInterface[mkNetworkInterfaceRateLimit] = *nv.RateLimit
+		} else {
+			networkInterface[mkNetworkInterfaceRateLimit] = 0
+		}
+
+		if nv.Tag != nil {
+			networkInterface[mkNetworkInterfaceVLANID] = *nv.Tag
+		} else {
+			networkInterface[mkNetworkInterfaceVLANID] = 0
+		}
+
+		if nv.MTU != nil {
+			networkInterface[mkNetworkInterfaceMTU] = *nv.MTU
+		} else {
+			networkInterface[mkNetworkInterfaceMTU] = 0
+		}
+
+		networkInterfacesMap[key] = networkInterface
+	}
+
+	networkInterfaces := utils.OrderedListFromMap(networkInterfacesMap)
+	initialization[mkInitializationIPConfig] = utils.OrderedListFromMap(ipConfigMap)
+
+	currentInitialization := d.Get(mkInitialization).([]any)
+
+	if len(currentInitialization) > 0 && currentInitialization[0] != nil {
+		currentInitializationMap := currentInitialization[0].(map[string]any)
+
+		initialization[mkInitializationUserAccount] = currentInitializationMap[mkInitializationUserAccount].([]any)
+	}
+
+	if len(clone) > 0 {
+		if len(currentInitialization) > 0 && currentInitialization[0] != nil {
+			currentInitializationBlock := currentInitialization[0].(map[string]any)
+			currentInitializationDNS := currentInitializationBlock[mkInitializationDNS].([]any)
+
+			if len(currentInitializationDNS) == 0 {
+				initialization[mkInitializationDNS] = []any{}
+			}
+
+			currentInitializationIPConfig := currentInitializationBlock[mkInitializationIPConfig].([]any)
+
+			if len(currentInitializationIPConfig) == 0 {
+				initialization[mkInitializationIPConfig] = []any{}
+			}
+
+			currentInitializationUserAccount := currentInitializationBlock[mkInitializationUserAccount].([]any)
+
+			if len(currentInitializationUserAccount) == 0 {
+				initialization[mkInitializationUserAccount] = []any{}
+			}
+
+			if len(initialization) > 0 {
+				e = d.Set(
+					mkInitialization,
+					[]any{initialization},
+				)
+			} else {
+				e = d.Set(mkInitialization, []any{})
+			}
+
+			diags = append(diags, diag.FromErr(e)...)
+		}
+
+		currentNetworkInterface := d.Get(mkNetworkInterface).([]any)
+
+		if len(currentNetworkInterface) > 0 {
+			err := d.Set(mkNetworkInterface, networkInterfaces)
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else {
+		if len(initialization) > 0 {
+			e = d.Set(mkInitialization, []any{initialization})
+		} else {
+			e = d.Set(mkInitialization, []any{})
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+
+		err := d.Set(mkNetworkInterface, networkInterfaces)
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the startup behavior to the one stored in the state.
+	var startup map[string]any
+
+	if containerConfig.StartupBehavior != nil {
+		startup = map[string]any{}
+
+		if containerConfig.StartupBehavior.Order != nil {
+			startup[mkStartupOrder] = *containerConfig.StartupBehavior.Order
+		} else {
+			startup[mkStartupOrder] = dvStartupOrder
+		}
+
+		if containerConfig.StartupBehavior.Up != nil {
+			startup[mkStartupUpDelay] = *containerConfig.StartupBehavior.Up
+		} else {
+			startup[mkStartupUpDelay] = dvStartupUpDelay
+		}
+
+		if containerConfig.StartupBehavior.Down != nil {
+			startup[mkStartupDownDelay] = *containerConfig.StartupBehavior.Down
+		} else {
+			startup[mkStartupDownDelay] = dvStartupDownDelay
+		}
+	}
+
+	currentStartup := d.Get(mkStartup).([]any)
+
+	switch {
+	case len(clone) > 0 && len(currentStartup) > 0:
+		err := d.Set(mkStartup, []any{startup})
+		diags = append(diags, diag.FromErr(err)...)
+	case len(startup) == 0:
+		err := d.Set(mkStartup, []any{})
+		diags = append(diags, diag.FromErr(err)...)
+	case len(currentStartup) > 0 ||
+		startup[mkStartupOrder] != mkStartupOrder ||
+		startup[mkStartupUpDelay] != dvStartupUpDelay ||
+		startup[mkStartupDownDelay] != dvStartupDownDelay:
+		err := d.Set(mkStartup, []any{startup})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	// Compare the operating system configuration to the one stored in the state.
+	operatingSystem := map[string]any{}
+
+	if containerConfig.OSType != nil {
+		operatingSystem[mkOperatingSystemType] = *containerConfig.OSType
+	} else {
+		// Default value of "ostype" is "" according to the API documentation.
+		operatingSystem[mkOperatingSystemType] = ""
+	}
+
+	currentOperatingSystem := d.Get(mkOperatingSystem).([]any)
+
+	if len(currentOperatingSystem) > 0 && currentOperatingSystem[0] != nil {
+		currentOperatingSystemMap := currentOperatingSystem[0].(map[string]any)
+
+		operatingSystem[mkOperatingSystemTemplateFileID] = currentOperatingSystemMap[mkOperatingSystemTemplateFileID]
+	}
+
+	if len(clone) > 0 {
+		if len(currentOperatingSystem) > 0 {
+			err := d.Set(
+				mkOperatingSystem,
+				[]any{operatingSystem},
+			)
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else if len(currentOperatingSystem) > 0 ||
+		operatingSystem[mkOperatingSystemType] != dvOperatingSystemType {
+		err := d.Set(mkOperatingSystem, []any{operatingSystem})
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	currentUnprivileged := types.CustomBool(d.Get(mkUnprivileged).(bool))
+
+	if len(clone) == 0 || currentUnprivileged {
+		if containerConfig.Unprivileged != nil {
+			e = d.Set(
+				mkUnprivileged,
+				bool(*containerConfig.Unprivileged),
+			)
+		} else {
+			e = d.Set(mkUnprivileged, false)
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	currentProtection := types.CustomBool(d.Get(mkProtection).(bool))
+
+	if len(clone) == 0 || currentProtection {
+		if containerConfig.Protection != nil {
+			e = d.Set(
+				mkProtection,
+				bool(*containerConfig.Protection),
+			)
+		} else {
+			e = d.Set(mkProtection, false)
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	currentStartOnBoot := types.CustomBool(d.Get(mkStartOnBoot).(bool))
+
+	if len(clone) == 0 || !currentStartOnBoot {
+		if containerConfig.StartOnBoot != nil {
+			e = d.Set(mkStartOnBoot, bool(*containerConfig.StartOnBoot))
+		} else {
+			// PVE returns nil for onboot when it is unset (false in practice).
+			e = d.Set(mkStartOnBoot, false)
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	currentHookScript := d.Get(mkHookScriptFileID).(string)
+
+	if len(clone) == 0 || currentHookScript != dvHookScript {
+		if containerConfig.HookScript != nil {
+			e = d.Set(mkHookScriptFileID, *containerConfig.HookScript)
+		} else {
+			e = d.Set(mkHookScriptFileID, "")
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	currentTags := d.Get(mkTags).([]any)
+
+	if len(clone) == 0 || len(currentTags) > 0 {
+		var tags []string
+
+		if containerConfig.Tags != nil {
+			for tag := range strings.SplitSeq(*containerConfig.Tags, ";") {
+				t := strings.TrimSpace(tag)
+				if len(t) > 0 {
+					tags = append(tags, t)
+				}
+			}
+
+			sort.Strings(tags)
+		}
+
+		e = d.Set(mkTags, tags)
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	envVarsMap := make(map[string]any)
+
+	if containerConfig.EnvironmentVariables != nil {
+		for k, v := range *containerConfig.EnvironmentVariables {
+			envVarsMap[k] = v
+		}
+	}
+
+	e = d.Set(mkEnvironmentVariables, envVarsMap)
+	diags = append(diags, diag.FromErr(e)...)
+
+	template := d.Get(mkTemplate).(bool)
+
+	if len(clone) == 0 || template {
+		if containerConfig.Template != nil {
+			e = d.Set(
+				mkTemplate,
+				bool(*containerConfig.Template),
+			)
+		} else {
+			e = d.Set(mkTemplate, false)
+		}
+
+		diags = append(diags, diag.FromErr(e)...)
+	}
+
+	// Determine the state of the container in order to update the "started" argument.
+	status, e := containerAPI.GetContainerStatus(ctx)
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	started := status.Status == "running"
+
+	ipv4Map := make(map[string]any)
+	ipv6Map := make(map[string]any)
+
+	if started && len(networkInterfaces) > 0 {
+		waitForIPConfig := getContainerWaitForIPConfig(d)
+
+		ifaces, err := containerAPI.WaitForContainerNetworkInterfaces(ctx, 10*time.Second, waitForIPConfig)
+		if err == nil {
+			for _, iface := range ifaces {
+				if iface.IPAddresses != nil && iface.Name != "lo" {
+					for _, ip := range *iface.IPAddresses {
+						switch ip.Type {
+						case "inet":
+							// store only the first IPv4 address per interface
+							if _, exists := ipv4Map[iface.Name]; !exists {
+								ipv4Map[iface.Name] = ip.Address
+							}
+						case "inet6":
+							// store only the first IPV6 address per interface
+							if _, exists := ipv6Map[iface.Name]; !exists {
+								ipv6Map[iface.Name] = ip.Address
+							}
+						default:
+							return diag.FromErr(fmt.Errorf("unexpected IP address type %q for interface %q", ip.Type, iface.Name))
+						}
+					}
+				}
+			}
+		} else {
+			tflog.Warn(ctx, "error waiting for container network interfaces", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
+
+	e = d.Set(mkIPv4, ipv4Map)
+	diags = append(diags, diag.FromErr(e)...)
+	e = d.Set(mkIPv6, ipv6Map)
+	diags = append(diags, diag.FromErr(e)...)
+
+	e = d.Set(mkStarted, started)
+	diags = append(diags, diag.FromErr(e)...)
+
+	return diags
+}
+
+func containerUpdate(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	var updateDiags diag.Diagnostics
+
+	updateTimeoutSec := d.Get(mkTimeoutUpdate).(int)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(updateTimeoutSec)*time.Second)
+	defer cancel()
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, e := config.GetClient()
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+
+	vmID, e := strconv.Atoi(d.Id())
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Prepare the new request object.
+	updateBody := containers.UpdateRequestBody{
+		Delete: []string{},
+	}
+
+	// Tracks whether any field of updateBody (other than Delete) was populated.
+	// Required so attributes that don't map to PUT /config — `started` (Start/Shutdown),
+	// `idmap` (SSH), timeouts and `wait_for_ip` (provider-local) — don't trigger an
+	// empty-body PUT that PVE rejects with HTTP 500 "no options specified" (#2883).
+	bodyDirty := false
+
+	rebootRequired := false
+	container := Container()
+
+	// Retrieve the clone argument as the update logic varies for clones.
+	clone := d.Get(mkClone).([]any)
+
+	// Prepare the new primitive values.
+	if d.HasChange(mkDescription) {
+		description := d.Get(mkDescription).(string)
+		updateBody.Description = &description
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkTemplate) {
+		template := types.CustomBool(d.Get(mkTemplate).(bool))
+		updateBody.Template = &template
+		bodyDirty = true
+	}
+
+	// Prepare the new console configuration.
+	if d.HasChange(mkConsole) {
+		consoleBlock, err := structure.GetSchemaBlock(
+			container,
+			d,
+			[]string{mkConsole},
+			0,
+			true,
+		)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		consoleEnabled := types.CustomBool(
+			consoleBlock[mkConsoleEnabled].(bool),
+		)
+		consoleMode := consoleBlock[mkConsoleMode].(string)
+		consoleTTYCount := consoleBlock[mkConsoleTTYCount].(int)
+
+		updateBody.ConsoleEnabled = &consoleEnabled
+		updateBody.ConsoleMode = &consoleMode
+		updateBody.TTY = &consoleTTYCount
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	// Prepare the new CPU configuration.
+	if d.HasChange(mkCPU) {
+		cpuBlock, err := structure.GetSchemaBlock(
+			container,
+			d,
+			[]string{mkCPU},
+			0,
+			true,
+		)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		cpuArchitecture := cpuBlock[mkCPUArchitecture].(string)
+		cpuCores := cpuBlock[mkCPUCores].(int)
+		cpuLimit := cpuBlock[mkCPULimit].(float64)
+		cpuUnits := cpuBlock[mkCPUUnits].(int)
+
+		updateBody.CPUArchitecture = &cpuArchitecture
+		updateBody.CPUCores = &cpuCores
+
+		if cpuLimit > 0 {
+			updateBody.CPULimit = &cpuLimit
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "cpulimit")
+		}
+
+		if cpuUnits > 0 {
+			updateBody.CPUUnits = &cpuUnits
+		}
+
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkDisk) {
+		diskBlock, err := structure.GetSchemaBlock(
+			container,
+			d,
+			[]string{mkDisk},
+			0,
+			true,
+		)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		rootFS := &containers.CustomRootFS{}
+
+		containerConfig, e := containerAPI.GetContainer(ctx)
+		if e != nil {
+			return diag.FromErr(e)
+		}
+
+		rootFS.Volume = containerConfig.RootFS.Volume
+
+		acl := types.CustomBool(diskBlock[mkDiskACL].(bool))
+		mountOptions := diskBlock[mkDiskMountOptions].([]any)
+		quota := types.CustomBool(diskBlock[mkDiskQuota].(bool))
+		replicate := types.CustomBool(diskBlock[mkDiskReplicate].(bool))
+
+		oldSize := containerConfig.RootFS.Size
+		size := types.DiskSizeFromGigabytes(int64(diskBlock[mkDiskSize].(int)))
+		// We should never reach this point. The `plan` should recreate the container, not update it, if the old size is larger.
+		if oldSize != nil && *oldSize > *size {
+			return diag.Errorf("new disk size (%s) has to be greater than the current disk (%s)", size, oldSize)
+		}
+
+		if !ptr.Eq(oldSize, size) {
+			resizeDiags := sdkresource.TaskResultDiags(containerAPI.ResizeContainerDisk(ctx, &containers.ResizeRequestBody{
+				Disk: "rootfs",
+				Size: size.String(),
+			}), "Container disk resize")
+			if resizeDiags.HasError() {
+				return resizeDiags
+			}
+
+			updateDiags = append(updateDiags, resizeDiags...)
+		}
+
+		rootFS.ACL = &acl
+		rootFS.Quota = &quota
+		rootFS.Replicate = &replicate
+		rootFS.Size = size
+
+		mountOptionsStrings := make([]string, 0, len(mountOptions))
+
+		for _, option := range mountOptions {
+			optionString := option.(string)
+			mountOptionsStrings = append(mountOptionsStrings, optionString)
+		}
+		// Always set, including empty, to allow clearing mount options
+		rootFS.MountOptions = &mountOptionsStrings
+
+		// To compare contents regardless of order, we can sort them.
+		// The schema already uses a suppress func for order, so we should be consistent.
+		sort.Strings(mountOptionsStrings)
+
+		currentMountOptions := containerConfig.RootFS.MountOptions
+
+		var currentMountOptionsSorted []string
+		if currentMountOptions != nil {
+			currentMountOptionsSorted = append(currentMountOptionsSorted, *currentMountOptions...)
+		}
+
+		sort.Strings(currentMountOptionsSorted)
+
+		if !slices.Equal(mountOptionsStrings, currentMountOptionsSorted) {
+			rebootRequired = true
+		}
+
+		updateBody.RootFS = rootFS
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkEnvironmentVariables) {
+		environmentVariables := containerGetEnvironmentVariables(d)
+		if environmentVariables != nil {
+			updateBody.EnvironmentVariables = environmentVariables
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "env")
+		}
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkFeatures) {
+		features, err := containerGetFeaturesForUpdate(container, d)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		updateBody.Features = features
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkHookScriptFileID) {
+		hookScript := d.Get(mkHookScriptFileID).(string)
+		if hookScript != "" {
+			updateBody.HookScript = &hookScript
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "hookscript")
+		}
+
+		bodyDirty = true
+	}
+
+	// Prepare the new initialization configuration.
+	initialization := d.Get(mkInitialization).([]any)
+	initializationDNSDomain := dvInitializationDNSDomain
+	initializationDNSServer := dvInitializationDNSServer
+	initializationHostname := dvInitializationHostname
+	initializationEntrypoint := dvInitializationEntrypoint
+
+	var initializationIPConfigIPv4Address []string
+
+	var initializationIPConfigIPv4Gateway []string
+
+	var initializationIPConfigIPv6Address []string
+
+	var initializationIPConfigIPv6Gateway []string
+
+	if len(initialization) > 0 && initialization[0] != nil {
+		initializationBlock := initialization[0].(map[string]any)
+		initializationDNS := initializationBlock[mkInitializationDNS].([]any)
+
+		if len(initializationDNS) > 0 && initializationDNS[0] != nil {
+			initializationDNSBlock := initializationDNS[0].(map[string]any)
+			initializationDNSDomain = initializationDNSBlock[mkInitializationDNSDomain].(string)
+
+			servers := initializationDNSBlock[mkInitializationDNSServers].([]any)
+			deprecatedServer := initializationDNSBlock[mkInitializationDNSServer].(string)
+
+			if len(servers) > 0 {
+				initializationDNSServer = strings.Join(utils.ConvertToStringSlice(servers), " ")
+			} else {
+				initializationDNSServer = deprecatedServer
+			}
+		}
+
+		initializationHostname = initializationBlock[mkInitializationHostname].(string)
+		initializationEntrypoint = initializationBlock[mkInitializationEntrypoint].(string)
+		initializationIPConfig := initializationBlock[mkInitializationIPConfig].([]any)
+
+		for _, c := range initializationIPConfig {
+			if c == nil {
+				continue
+			}
+
+			configBlock := c.(map[string]any)
+			ipv4 := configBlock[mkInitializationIPConfigIPv4].([]any)
+
+			if len(ipv4) > 0 && ipv4[0] != nil {
+				ipv4Block := ipv4[0].(map[string]any)
+
+				initializationIPConfigIPv4Address = append(
+					initializationIPConfigIPv4Address,
+					ipv4Block[mkInitializationIPConfigIPv4Address].(string),
+				)
+
+				initializationIPConfigIPv4Gateway = append(
+					initializationIPConfigIPv4Gateway,
+					ipv4Block[mkInitializationIPConfigIPv4Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv4Address = append(initializationIPConfigIPv4Address, "")
+				initializationIPConfigIPv4Gateway = append(initializationIPConfigIPv4Gateway, "")
+			}
+
+			ipv6 := configBlock[mkInitializationIPConfigIPv6].([]any)
+
+			if len(ipv6) > 0 && ipv6[0] != nil {
+				ipv6Block := ipv6[0].(map[string]any)
+
+				initializationIPConfigIPv6Address = append(
+					initializationIPConfigIPv6Address,
+					ipv6Block[mkInitializationIPConfigIPv6Address].(string),
+				)
+
+				initializationIPConfigIPv6Gateway = append(
+					initializationIPConfigIPv6Gateway,
+					ipv6Block[mkInitializationIPConfigIPv6Gateway].(string),
+				)
+			} else {
+				initializationIPConfigIPv6Address = append(initializationIPConfigIPv6Address, "")
+				initializationIPConfigIPv6Gateway = append(initializationIPConfigIPv6Gateway, "")
+			}
+		}
+	}
+
+	if d.HasChange(mkInitialization + ".0." + mkInitializationDNS) {
+		if initializationDNSDomain != "" {
+			updateBody.DNSDomain = &initializationDNSDomain
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "searchdomain")
+		}
+
+		if initializationDNSServer != "" {
+			updateBody.DNSServer = &initializationDNSServer
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "nameserver")
+		}
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkInitialization + ".0." + mkInitializationHostname) {
+		updateBody.Hostname = &initializationHostname
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkInitialization + ".0." + mkInitializationEntrypoint) {
+		if initializationEntrypoint != "" {
+			updateBody.Entrypoint = &initializationEntrypoint
+		} else {
+			updateBody.Delete = append(updateBody.Delete, "entrypoint")
+		}
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	// Prepare the new memory configuration.
+	if d.HasChange(mkMemory) {
+		memoryBlock, err := structure.GetSchemaBlock(
+			container,
+			d,
+			[]string{mkMemory},
+			0,
+			true,
+		)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		memoryDedicated := memoryBlock[mkMemoryDedicated].(int)
+		memorySwap := memoryBlock[mkMemorySwap].(int)
+
+		updateBody.DedicatedMemory = &memoryDedicated
+		updateBody.Swap = &memorySwap
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	// Prepare the new device passthrough configuration.
+	if d.HasChange(mkDevicePassthrough) {
+		_, newDevicePassthrough := d.GetChange(mkDevicePassthrough)
+
+		devicePassthrough := newDevicePassthrough.([]any)
+		passthroughDevices := make(
+			containers.CustomPassthroughDevices,
+			len(devicePassthrough),
+		)
+
+		for i, dp := range devicePassthrough {
+			devicePassthroughMap := dp.(map[string]any)
+			devicePassthroughObject := containers.CustomPassthroughDevice{}
+
+			denyWrite := types.CustomBool(devicePassthroughMap[mkDevicePassthroughDenyWrite].(bool))
+			gid := devicePassthroughMap[mkDevicePassthroughGID].(int)
+			mode := devicePassthroughMap[mkDevicePassthroughMode].(string)
+			path := devicePassthroughMap[mkDevicePassthroughPath].(string)
+			uid := devicePassthroughMap[mkDevicePassthroughUID].(int)
+
+			devicePassthroughObject.DenyWrite = &denyWrite
+			devicePassthroughObject.GID = &gid
+			devicePassthroughObject.Mode = &mode
+			devicePassthroughObject.Path = path
+			devicePassthroughObject.UID = &uid
+
+			passthroughDevices[fmt.Sprintf("dev%d", i)] = &devicePassthroughObject
+		}
+
+		updateBody.PassthroughDevices = passthroughDevices
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	// Prepare the new idmap configuration (applied via SSH after the lock is released).
+	var idmaps []containers.CustomIDMapEntry
+
+	idmapChanged := d.HasChange(mkIDMap)
+	if idmapChanged {
+		_, newIDMap := d.GetChange(mkIDMap)
+		idmaps = containerGetIDMaps(newIDMap.([]any))
+
+		rebootRequired = true
+	}
+
+	// Prepare the new mount point configuration.
+	if d.HasChange(mkMountPoint) {
+		_, newMountPoints := d.GetChange(mkMountPoint)
+
+		mountPoints := newMountPoints.([]any)
+
+		mountPointsMap, err := containerGetMountPointsMap(mountPoints)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		updateBody.MountPoints = mountPointsMap
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	// Prepare the new network interface configuration.
+	networkInterface := d.Get(mkNetworkInterface).([]any)
+
+	if len(networkInterface) == 0 && len(clone) > 0 {
+		networkInterface, e = containerGetExistingNetworkInterface(ctx, containerAPI)
+		if e != nil {
+			return diag.FromErr(e)
+		}
+	}
+
+	if d.HasChange(mkInitialization+".0."+mkInitializationIPConfig) ||
+		d.HasChange(mkNetworkInterface) {
+		networkInterfaces := make(
+			containers.CustomNetworkInterfaces,
+			len(networkInterface),
+		)
+
+		hostManagedSupported := supportContainerHostManaged(ctx, client)
+
+		for ni, nv := range networkInterface {
+			networkInterfaceMap := nv.(map[string]any)
+			networkInterfaceObject := containers.CustomNetworkInterface{}
+
+			bridge := networkInterfaceMap[mkNetworkInterfaceBridge].(string)
+			enabled := networkInterfaceMap[mkNetworkInterfaceEnabled].(bool)
+			firewall := types.CustomBool(
+				networkInterfaceMap[mkNetworkInterfaceFirewall].(bool),
+			)
+			hostManaged := networkInterfaceMap[mkNetworkInterfaceHostManaged].(bool)
+			macAddress := networkInterfaceMap[mkNetworkInterfaceMACAddress].(string)
+			name := networkInterfaceMap[mkNetworkInterfaceName].(string)
+			rateLimit := networkInterfaceMap[mkNetworkInterfaceRateLimit].(float64)
+			vlanID := networkInterfaceMap[mkNetworkInterfaceVLANID].(int)
+			mtu := networkInterfaceMap[mkNetworkInterfaceMTU].(int)
+
+			if bridge != "" {
+				networkInterfaceObject.Bridge = &bridge
+			}
+
+			networkInterfaceObject.Enabled = enabled
+			networkInterfaceObject.Firewall = &firewall
+
+			if hostManagedSupported || hostManaged {
+				networkInterfaceObject.HostManaged = types.CustomBool(hostManaged).Pointer()
+			}
+
+			if len(initializationIPConfigIPv4Address) > ni {
+				if initializationIPConfigIPv4Address[ni] != "" {
+					networkInterfaceObject.IPv4Address = &initializationIPConfigIPv4Address[ni]
+				}
+
+				if initializationIPConfigIPv4Gateway[ni] != "" {
+					networkInterfaceObject.IPv4Gateway = &initializationIPConfigIPv4Gateway[ni]
+				}
+
+				if initializationIPConfigIPv6Address[ni] != "" {
+					networkInterfaceObject.IPv6Address = &initializationIPConfigIPv6Address[ni]
+				}
+
+				if initializationIPConfigIPv6Gateway[ni] != "" {
+					networkInterfaceObject.IPv6Gateway = &initializationIPConfigIPv6Gateway[ni]
+				}
+			}
+
+			if macAddress != "" {
+				networkInterfaceObject.MACAddress = &macAddress
+			}
+
+			networkInterfaceObject.Name = name
+
+			if rateLimit != 0 {
+				networkInterfaceObject.RateLimit = &rateLimit
+			}
+
+			if vlanID != 0 {
+				networkInterfaceObject.Tag = &vlanID
+			}
+
+			if mtu != 0 {
+				networkInterfaceObject.MTU = &mtu
+			}
+
+			networkInterfaces[fmt.Sprintf("net%d", ni)] = &networkInterfaceObject
+		}
+
+		updateBody.NetworkInterfaces = networkInterfaces
+
+		for key, ni := range updateBody.NetworkInterfaces {
+			if !ni.Enabled {
+				updateBody.Delete = append(updateBody.Delete, key)
+			}
+		}
+
+		for i := len(updateBody.NetworkInterfaces); i < maxNetworkInterfaces; i++ {
+			updateBody.Delete = append(updateBody.Delete, fmt.Sprintf("net%d", i))
+		}
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkStartup) {
+		updateBody.StartupBehavior = containerGetStartupBehavior(d)
+		if updateBody.StartupBehavior == nil {
+			updateBody.Delete = append(updateBody.Delete, "startup")
+		}
+
+		bodyDirty = true
+	}
+
+	// Prepare the new operating system configuration.
+	if d.HasChange(mkOperatingSystem) {
+		operatingSystem, err := structure.GetSchemaBlock(
+			container,
+			d,
+			[]string{mkOperatingSystem},
+			0,
+			true,
+		)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		operatingSystemType := operatingSystem[mkOperatingSystemType].(string)
+
+		updateBody.OSType = &operatingSystemType
+
+		rebootRequired = true
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkProtection) {
+		protection := types.CustomBool(d.Get(mkProtection).(bool))
+		updateBody.Protection = &protection
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkStartOnBoot) {
+		startOnBoot := types.CustomBool(d.Get(mkStartOnBoot).(bool))
+		updateBody.StartOnBoot = &startOnBoot
+		bodyDirty = true
+	}
+
+	if d.HasChange(mkTags) {
+		tagString := containerGetTagsString(d)
+		updateBody.Tags = &tagString
+		bodyDirty = true
+	}
+
+	// Only PUT /config when we actually have fields to send. Attributes whose changes
+	// don't populate updateBody (`started`, `idmap`, timeouts, `wait_for_ip`) must not
+	// trigger an empty-body request — PVE rejects those with HTTP 500 (#2883).
+	if bodyDirty || len(updateBody.Delete) > 0 {
+		e = containerAPI.UpdateContainer(ctx, &updateBody)
+		if e != nil {
+			return diag.FromErr(e)
+		}
+	}
+
+	// Wait for the container's lock to be released.
+	e = containerAPI.WaitForContainerConfigUnlock(ctx, true)
+	if e != nil {
+		return diag.FromErr(e)
+	}
+
+	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// This must happen after the lock is released to avoid PVE overwriting the config file.
+	if idmapChanged {
+		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	// Determine if the state of the container needs to be changed.
+	started := d.Get(mkStarted).(bool)
+	template := d.Get(mkTemplate).(bool)
+
+	if d.HasChange(mkStarted) && !template {
+		if started {
+			updateDiags = sdkresource.TaskResultDiags(containerAPI.StartContainer(ctx), "Container start")
+			if updateDiags.HasError() {
+				return updateDiags
+			}
+		} else {
+			forceStop := types.CustomBool(true)
+			// Using delete timeout here as we're in the similar situation
+			// as in the delete function, where we need to wait for the container
+			// to be stopped before we can proceed with the update.
+			// see `containerDelete` function for more details about the logic here
+			// Needs to be refactored to a common function
+			shutdownTimeoutSec := max(1, d.Get(mkTimeoutDelete).(int)-5)
+
+			shutdownDiags := sdkresource.TaskResultDiags(containerAPI.ShutdownContainer(ctx, &containers.ShutdownRequestBody{
+				ForceStop: &forceStop,
+				Timeout:   &shutdownTimeoutSec,
+			}), "Container shutdown")
+			if shutdownDiags.HasError() {
+				return shutdownDiags
+			}
+
+			updateDiags = append(updateDiags, shutdownDiags...)
+
+			if e = containerAPI.WaitForContainerStatus(ctx, "stopped"); e != nil {
+				return append(updateDiags, diag.FromErr(e)...)
+			}
+
+			rebootRequired = false
+		}
+	}
+
+	// As a final step in the update procedure, we might need to reboot the container.
+	if !template && started && rebootRequired {
+		rebootTimeout := 300
+
+		rebootDiags := sdkresource.TaskResultDiags(containerAPI.RebootContainer(
+			ctx,
+			&containers.RebootRequestBody{
+				Timeout: &rebootTimeout,
+			},
+		), "Container reboot")
+		if rebootDiags.HasError() {
+			return rebootDiags
+		}
+
+		updateDiags = append(updateDiags, rebootDiags...)
+	}
+
+	return append(updateDiags, containerRead(ctx, d, m)...)
+}
+
+func containerDelete(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	deleteTimeoutSec := d.Get(mkTimeoutDelete).(int)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(deleteTimeoutSec)*time.Second)
+	defer cancel()
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+
+	vmID, err := strconv.Atoi(d.Id())
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Shut down the container before deleting it.
+	status, err := containerAPI.GetContainerStatus(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	var diags diag.Diagnostics
+
+	if status.Status != "stopped" {
+		forceStop := types.CustomBool(true)
+
+		shutdownDiags := sdkresource.TaskResultDiags(containerAPI.ShutdownContainer(
+			ctx,
+			&containers.ShutdownRequestBody{
+				ForceStop: &forceStop,
+				// the timeout here must be less that the context timeout set above,
+				// otherwise the context will be cancelled before PVE forcefully stops the container
+				Timeout: new(max(1, deleteTimeoutSec-5)),
+			},
+		), "Container shutdown")
+		if shutdownDiags.HasError() {
+			return shutdownDiags
+		}
+
+		diags = append(diags, shutdownDiags...)
+
+		err = containerAPI.WaitForContainerStatus(ctx, "stopped")
+		if err != nil {
+			return append(diags, diag.FromErr(err)...)
+		}
+	}
+
+	deleteResult := containerAPI.DeleteContainer(ctx)
+	if errors.Is(deleteResult.Err(), api.ErrResourceDoesNotExist) {
+		d.SetId("")
+
+		return diags
+	}
+
+	diags = append(diags, sdkresource.TaskResultDiags(deleteResult, "Container delete")...)
+	if diags.HasError() {
+		return diags
+	}
+
+	// Wait for the state to become unavailable as that clearly indicates the destruction of the container.
+	err = containerAPI.WaitForContainerStatus(ctx, "")
+	if err == nil {
+		return diag.Errorf("failed to delete container \"%d\"", vmID)
+	}
+
+	d.SetId("")
+
+	return diags
+}
+
+func getContainerWaitForIPConfig(d *schema.ResourceData) *containers.WaitForIPConfig {
+	waitForIPList, ok := d.Get(mkWaitForIP).([]any)
+	if !ok || len(waitForIPList) == 0 || waitForIPList[0] == nil {
+		return nil
+	}
+
+	waitForIPBlock := waitForIPList[0].(map[string]any)
+
+	config := &containers.WaitForIPConfig{}
+
+	if ipv4, ok := waitForIPBlock[mkWaitForIPIPv4].(bool); ok {
+		config.IPv4 = ipv4
+	}
+
+	if ipv6, ok := waitForIPBlock[mkWaitForIPIPv6].(bool); ok {
+		config.IPv6 = ipv6
+	}
+
+	// if both are false, return nil for backward compatibility
+	if !config.IPv4 && !config.IPv6 {
+		return nil
+	}
+
+	return config
+}
+
+func parseImportIDWithNodeName(id string) (string, string, error) {
+	nodeName, id, found := strings.Cut(id, "/")
+
+	if !found {
+		return "", "", fmt.Errorf("unexpected format of ID (%s), expected node/id", id)
+	}
+
+	return nodeName, id, nil
+}
+
+func skipDnsDiffIfEmpty(k, oldValue, newValue string, d *schema.ResourceData) bool {
+	dnsDataKey := mkInitialization + ".0." + mkInitializationDNS
+	if k == dnsDataKey+".#" {
+		if oldValue == "0" && newValue == "1" {
+			// if dns block's attributes are empty, do not report change
+			domain := d.Get(dnsDataKey + ".0." + mkInitializationDNSDomain).(string)
+			server := d.Get(dnsDataKey + ".0." + mkInitializationDNSServer).(string)
+			servers := d.Get(dnsDataKey + ".0." + mkInitializationDNSServers).([]any)
+
+			return domain == "" && server == "" && len(servers) == 0
+		}
+	}
+
+	return false
+}

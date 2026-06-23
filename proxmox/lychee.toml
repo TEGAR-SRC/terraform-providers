@@ -1,0 +1,33 @@
+# Lychee configuration file
+# Exclude specific files from link checking
+# Note: PR template and Claude agent skill files use repo-root-relative links that
+# GitHub/agents resolve correctly, but lychee resolves them relative to the file's
+# directory.
+exclude_path = [
+    "CONTRIBUTORS.md",
+    "CHANGELOG.md",
+    "cache",
+    ".terraform",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".claude",
+    ".dev",
+    "build"
+]
+
+# Exclude URL patterns (regex)
+exclude = [
+    "https://.*:8006/"  # Exclude Proxmox server URLs
+]
+
+# Enable verbose output
+verbose = "warn"
+
+# Disable progress bar (better for CI)
+no_progress = true
+
+accept = [429, 200]
+
+# GitHub occasionally returns 502 under concurrent requests; retry more aggressively
+# before failing the job.
+max_retries = 5
+retry_wait_time = 2

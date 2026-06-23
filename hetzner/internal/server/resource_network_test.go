@@ -1,0 +1,266 @@
+package server_test
+
+import (
+	"fmt"
+	"net"
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/network"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/server"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/teste2e"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/testmux"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/testsupport"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/testtemplate"
+)
+
+func TestAccServerNetworkResource_NetworkID(t *testing.T) {
+	tmplMan := testtemplate.Manager{}
+
+	var (
+		hcNetwork hcloud.Network
+		hcServer  hcloud.Server
+	)
+
+	ntws := network.NewBlueprint(t)
+	srvs := server.NewBlueprint(t)
+
+	res1 := &server.RDataNetwork{
+		Name:      "attachment",
+		ServerID:  srvs.ServerA.TFID() + ".id",
+		NetworkID: ntws.NetworkA.TFID() + ".id",
+		IP:        "10.0.1.5",
+		AliasIPs:  []string{"10.0.1.6", "10.0.1.7"},
+		DependsOn: []string{ntws.SubnetA1.TFID()},
+	}
+	res1.SetRName("attachment")
+
+	// Remove alias ips
+	res2 := &server.RDataNetwork{
+		Name:      res1.Name,
+		ServerID:  res1.ServerID,
+		NetworkID: res1.NetworkID,
+		IP:        res1.IP,
+		DependsOn: res1.DependsOn,
+	}
+	res2.SetRName("attachment")
+
+	// Add other alias ips
+	res3 := &server.RDataNetwork{
+		Name:      res1.Name,
+		ServerID:  res1.ServerID,
+		NetworkID: res1.NetworkID,
+		IP:        res1.IP,
+		AliasIPs:  []string{"10.0.1.8"},
+		DependsOn: res1.DependsOn,
+	}
+	res3.SetRName("attachment")
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 teste2e.PreCheck(t),
+		ProtoV6ProviderFactories: testmux.ProtoV6ProviderFactories(),
+		CheckDestroy:             testsupport.CheckResourcesDestroyed(server.ResourceType, server.ByID(t, nil)),
+		Steps: []resource.TestStep{
+			{
+				Config: tmplMan.Render(t,
+					"testdata/r/hcloud_network", ntws.NetworkA,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA1,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA2,
+					"testdata/r/hcloud_server", srvs.ServerA,
+					"testdata/r/hcloud_server_network", res1,
+				),
+				Check: resource.ComposeTestCheckFunc(
+					testsupport.CheckResourceExists(srvs.ServerA.TFID(), server.ByID(t, &hcServer)),
+					testsupport.CheckResourceExists(ntws.NetworkA.TFID(), network.ByID(t, &hcNetwork)),
+					testsupport.LiftTCF(hasServerNetwork(t, &hcServer, &hcNetwork, "10.0.1.5", "10.0.1.6", "10.0.1.7")),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("ip"),
+						knownvalue.StringExact("10.0.1.5")),
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("alias_ips"),
+						knownvalue.SetExact([]knownvalue.Check{
+							knownvalue.StringExact("10.0.1.6"),
+							knownvalue.StringExact("10.0.1.7"),
+						})),
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("mac_address"),
+						knownvalue.StringFunc(func(v string) error {
+							_, err := net.ParseMAC(v)
+							return err
+						})),
+				},
+			},
+			{
+				Config: tmplMan.Render(t,
+					"testdata/r/hcloud_network", ntws.NetworkA,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA1,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA2,
+					"testdata/r/hcloud_server", srvs.ServerA,
+					"testdata/r/hcloud_server_network", res2,
+				),
+				Check: resource.ComposeTestCheckFunc(
+					testsupport.CheckResourceExists(srvs.ServerA.TFID(), server.ByID(t, &hcServer)),
+					testsupport.CheckResourceExists(ntws.NetworkA.TFID(), network.ByID(t, &hcNetwork)),
+					testsupport.LiftTCF(hasServerNetwork(t, &hcServer, &hcNetwork, "10.0.1.5")),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(res2.TFID(),
+						tfjsonpath.New("ip"),
+						knownvalue.StringExact("10.0.1.5")),
+					statecheck.ExpectKnownValue(res2.TFID(),
+						tfjsonpath.New("alias_ips"),
+						knownvalue.SetSizeExact(0)),
+					statecheck.ExpectKnownValue(res2.TFID(),
+						tfjsonpath.New("mac_address"),
+						knownvalue.StringFunc(func(v string) error {
+							_, err := net.ParseMAC(v)
+							return err
+						})),
+				},
+			},
+			{
+				Config: tmplMan.Render(t,
+					"testdata/r/hcloud_network", ntws.NetworkA,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA1,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA2,
+					"testdata/r/hcloud_server", srvs.ServerA,
+					"testdata/r/hcloud_server_network", res3,
+				),
+				Check: resource.ComposeTestCheckFunc(
+					testsupport.CheckResourceExists(srvs.ServerA.TFID(), server.ByID(t, &hcServer)),
+					testsupport.CheckResourceExists(ntws.NetworkA.TFID(), network.ByID(t, &hcNetwork)),
+					testsupport.LiftTCF(hasServerNetwork(t, &hcServer, &hcNetwork, "10.0.1.5", "10.0.1.8")),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(res3.TFID(),
+						tfjsonpath.New("ip"),
+						knownvalue.StringExact("10.0.1.5")),
+					statecheck.ExpectKnownValue(res3.TFID(),
+						tfjsonpath.New("alias_ips"),
+						knownvalue.SetExact([]knownvalue.Check{
+							knownvalue.StringExact("10.0.1.8"),
+						})),
+					statecheck.ExpectKnownValue(res3.TFID(),
+						tfjsonpath.New("mac_address"),
+						knownvalue.StringFunc(func(v string) error {
+							_, err := net.ParseMAC(v)
+							return err
+						})),
+				},
+			},
+			{
+				ResourceName:      res3.TFID(),
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateIdFunc: func(_ *terraform.State) (string, error) {
+					return fmt.Sprintf("%d-%d", hcServer.ID, hcNetwork.ID), nil
+				},
+			},
+		},
+	})
+}
+
+func TestAccServerNetworkResource_SubnetID(t *testing.T) {
+	tmplMan := testtemplate.Manager{}
+
+	var (
+		hcNetwork hcloud.Network
+		hcServer  hcloud.Server
+	)
+
+	ntws := network.NewBlueprint(t)
+	srvs := server.NewBlueprint(t)
+
+	res1 := &server.RDataNetwork{
+		Name:     "attachment",
+		ServerID: srvs.ServerA.TFID() + ".id",
+		SubNetID: ntws.SubnetA2.TFID() + ".id",
+	}
+	res1.SetRName("attachment")
+
+	// Remove alias ips
+	res2 := &server.RDataNetwork{
+		Name:     res1.Name,
+		ServerID: res1.ServerID,
+		SubNetID: res1.SubNetID,
+	}
+	res2.SetRName("attachment")
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 teste2e.PreCheck(t),
+		ProtoV6ProviderFactories: testmux.ProtoV6ProviderFactories(),
+		CheckDestroy:             testsupport.CheckResourcesDestroyed(server.ResourceType, server.ByID(t, nil)),
+		Steps: []resource.TestStep{
+			{
+				Config: tmplMan.Render(t,
+					"testdata/r/hcloud_network", ntws.NetworkA,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA1,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA2,
+					"testdata/r/hcloud_server", srvs.ServerA,
+					"testdata/r/hcloud_server_network", res1,
+				),
+				Check: resource.ComposeTestCheckFunc(
+					testsupport.CheckResourceExists(srvs.ServerA.TFID(), server.ByID(t, &hcServer)),
+					testsupport.CheckResourceExists(ntws.NetworkA.TFID(), network.ByID(t, &hcNetwork)),
+					testsupport.LiftTCF(hasServerNetwork(t, &hcServer, &hcNetwork, "10.0.2.1")),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("ip"),
+						knownvalue.StringExact("10.0.2.1")),
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("alias_ips"),
+						knownvalue.SetSizeExact(0)),
+				},
+			},
+			{
+				Config: tmplMan.Render(t,
+					"testdata/r/hcloud_network", ntws.NetworkA,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA1,
+					"testdata/r/hcloud_network_subnet", ntws.SubnetA2,
+					"testdata/r/hcloud_server", srvs.ServerA,
+					"testdata/r/hcloud_server_network", res2,
+				),
+				Check: resource.ComposeTestCheckFunc(
+					testsupport.CheckResourceExists(srvs.ServerA.TFID(), server.ByID(t, &hcServer)),
+					testsupport.CheckResourceExists(ntws.NetworkA.TFID(), network.ByID(t, &hcNetwork)),
+					testsupport.LiftTCF(hasServerNetwork(t, &hcServer, &hcNetwork, "10.0.2.1")),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("ip"),
+						knownvalue.StringExact("10.0.2.1")),
+					statecheck.ExpectKnownValue(res1.TFID(),
+						tfjsonpath.New("alias_ips"),
+						knownvalue.SetSizeExact(0)),
+				},
+			},
+		},
+	})
+}
+
+func hasServerNetwork(t *testing.T, s *hcloud.Server, nw *hcloud.Network, ips ...string) func() error {
+	return func() error {
+		attachment := s.PrivateNetFor(nw)
+		if !assert.NotNil(t, attachment, "server has no private network") {
+			return nil
+		}
+		assert.Contains(t, ips, attachment.IP.String())
+		if len(ips) > 1 {
+			for _, aliasIP := range attachment.Aliases {
+				assert.Contains(t, ips, aliasIP.String())
+			}
+		}
+
+		return nil
+	}
+}

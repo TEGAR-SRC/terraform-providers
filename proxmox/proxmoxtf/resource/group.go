@@ -1,0 +1,328 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package resource
+
+import (
+	"context"
+	"errors"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox/access"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/types"
+	"github.com/bpg/terraform-provider-proxmox/proxmoxtf"
+)
+
+const (
+	dvResourceVirtualEnvironmentGroupComment = ""
+
+	mkResourceVirtualEnvironmentGroupACL          = "acl"
+	mkResourceVirtualEnvironmentGroupACLPath      = "path"
+	mkResourceVirtualEnvironmentGroupACLPropagate = "propagate"
+	mkResourceVirtualEnvironmentGroupACLRoleID    = "role_id"
+	mkResourceVirtualEnvironmentGroupComment      = "comment"
+	mkResourceVirtualEnvironmentGroupID           = "group_id"
+	mkResourceVirtualEnvironmentGroupMembers      = "members"
+)
+
+// Group returns a resource that manages a group in the Proxmox VE access control list.
+func Group() *schema.Resource {
+	return &schema.Resource{
+		Schema: map[string]*schema.Schema{
+			mkResourceVirtualEnvironmentGroupACL: {
+				Type:        schema.TypeSet,
+				Description: "The access control list",
+				Optional:    true,
+				Deprecated: "Manage ACLs via the dedicated `proxmox_acl` resource instead. " +
+					"The inline `acl` block is no longer auto-populated from the cluster on refresh " +
+					"or import; existing groups with `acl` blocks continue to work, but new code " +
+					"should use `proxmox_acl`.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkResourceVirtualEnvironmentGroupACLPath: {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The path",
+						},
+						mkResourceVirtualEnvironmentGroupACLPropagate: {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Description: "Whether to propagate to child paths",
+							Default:     false,
+						},
+						mkResourceVirtualEnvironmentGroupACLRoleID: {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The role id",
+						},
+					},
+				},
+			},
+			mkResourceVirtualEnvironmentGroupComment: {
+				Type:        schema.TypeString,
+				Description: "The group comment",
+				Optional:    true,
+				Default:     dvResourceVirtualEnvironmentGroupComment,
+			},
+			mkResourceVirtualEnvironmentGroupID: {
+				Type:        schema.TypeString,
+				Description: "The group id",
+				Required:    true,
+				ForceNew:    true,
+			},
+			mkResourceVirtualEnvironmentGroupMembers: {
+				Type:        schema.TypeSet,
+				Description: "The group members",
+				Computed:    true,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+			},
+		},
+		CreateContext: groupCreate,
+		ReadContext:   groupRead,
+		UpdateContext: groupUpdate,
+		DeleteContext: groupDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
+	}
+}
+
+func groupCreate(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	comment := d.Get(mkResourceVirtualEnvironmentGroupComment).(string)
+	groupID := d.Get(mkResourceVirtualEnvironmentGroupID).(string)
+
+	body := &access.GroupCreateRequestBody{
+		Comment: &comment,
+		ID:      groupID,
+	}
+
+	err = client.Access().CreateGroup(ctx, body)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	d.SetId(groupID)
+
+	aclParsed := d.Get(mkResourceVirtualEnvironmentGroupACL).(*schema.Set).List()
+
+	for _, v := range aclParsed {
+		aclDelete := types.CustomBool(false)
+		aclEntry := v.(map[string]interface{})
+		aclPropagate := types.CustomBool(
+			aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate].(bool),
+		)
+
+		aclBody := &access.ACLUpdateRequestBody{
+			Delete:    &aclDelete,
+			Groups:    []string{groupID},
+			Path:      aclEntry[mkResourceVirtualEnvironmentGroupACLPath].(string),
+			Propagate: &aclPropagate,
+			Roles:     []string{aclEntry[mkResourceVirtualEnvironmentGroupACLRoleID].(string)},
+		}
+
+		err := client.Access().UpdateACL(ctx, aclBody)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	return groupRead(ctx, d, m)
+}
+
+func groupRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	groupID := d.Id()
+
+	group, err := client.Access().GetGroup(ctx, groupID)
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			d.SetId("")
+
+			return nil
+		}
+		return diag.FromErr(err)
+	}
+
+	// Only populate the inline `acl` attribute when state already tracks
+	// entries for this resource. Otherwise, ACLs managed externally (via the
+	// dedicated `proxmox_acl` resource) leak into state and trigger a
+	// destructive refresh-loop on every plan. See #2866.
+	if d.Get(mkResourceVirtualEnvironmentGroupACL).(*schema.Set).Len() > 0 {
+		acl, err := client.Access().GetACL(ctx)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		var aclParsed []any
+
+		for _, v := range acl {
+			if v.Type == "group" && v.UserOrGroupID == groupID {
+				aclEntry := map[string]any{}
+
+				aclEntry[mkResourceVirtualEnvironmentGroupACLPath] = v.Path
+
+				if v.Propagate != nil {
+					aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate] = bool(*v.Propagate)
+				} else {
+					aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate] = false
+				}
+
+				aclEntry[mkResourceVirtualEnvironmentGroupACLRoleID] = v.RoleID
+
+				aclParsed = append(aclParsed, aclEntry)
+			}
+		}
+
+		err = d.Set(mkResourceVirtualEnvironmentGroupACL, aclParsed)
+		diags = append(diags, diag.FromErr(err)...)
+	}
+
+	if group.Comment != nil {
+		err = d.Set(mkResourceVirtualEnvironmentGroupComment, group.Comment)
+	} else {
+		err = d.Set(mkResourceVirtualEnvironmentGroupComment, "")
+	}
+	diags = append(diags, diag.FromErr(err)...)
+
+	err = d.Set(mkResourceVirtualEnvironmentGroupMembers, group.Members)
+	diags = append(diags, diag.FromErr(err)...)
+
+	err = d.Set(mkResourceVirtualEnvironmentGroupID, groupID)
+	diags = append(diags, diag.FromErr(err)...)
+
+	return diags
+}
+
+func groupUpdate(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	comment := d.Get(mkResourceVirtualEnvironmentGroupComment).(string)
+	groupID := d.Id()
+
+	body := &access.GroupUpdateRequestBody{
+		Comment: &comment,
+	}
+
+	err = client.Access().UpdateGroup(ctx, groupID, body)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	aclArgOld, aclArg := d.GetChange(mkResourceVirtualEnvironmentGroupACL)
+	aclParsedOld := aclArgOld.(*schema.Set).List()
+
+	for _, v := range aclParsedOld {
+		aclDelete := types.CustomBool(true)
+		aclEntry := v.(map[string]interface{})
+		aclPropagate := types.CustomBool(
+			aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate].(bool),
+		)
+
+		aclBody := &access.ACLUpdateRequestBody{
+			Delete:    &aclDelete,
+			Groups:    []string{groupID},
+			Path:      aclEntry[mkResourceVirtualEnvironmentGroupACLPath].(string),
+			Propagate: &aclPropagate,
+			Roles:     []string{aclEntry[mkResourceVirtualEnvironmentGroupACLRoleID].(string)},
+		}
+
+		err := client.Access().UpdateACL(ctx, aclBody)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	aclParsed := aclArg.(*schema.Set).List()
+
+	for _, v := range aclParsed {
+		aclDelete := types.CustomBool(false)
+		aclEntry := v.(map[string]interface{})
+		aclPropagate := types.CustomBool(
+			aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate].(bool),
+		)
+
+		aclBody := &access.ACLUpdateRequestBody{
+			Delete:    &aclDelete,
+			Groups:    []string{groupID},
+			Path:      aclEntry[mkResourceVirtualEnvironmentGroupACLPath].(string),
+			Propagate: &aclPropagate,
+			Roles:     []string{aclEntry[mkResourceVirtualEnvironmentGroupACLRoleID].(string)},
+		}
+
+		err := client.Access().UpdateACL(ctx, aclBody)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	return groupRead(ctx, d, m)
+}
+
+func groupDelete(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	aclParsed := d.Get(mkResourceVirtualEnvironmentGroupACL).(*schema.Set).List()
+	groupID := d.Id()
+
+	for _, v := range aclParsed {
+		aclDelete := types.CustomBool(true)
+		aclEntry := v.(map[string]interface{})
+		aclPropagate := types.CustomBool(
+			aclEntry[mkResourceVirtualEnvironmentGroupACLPropagate].(bool),
+		)
+
+		aclBody := &access.ACLUpdateRequestBody{
+			Delete:    &aclDelete,
+			Groups:    []string{groupID},
+			Path:      aclEntry[mkResourceVirtualEnvironmentGroupACLPath].(string),
+			Propagate: &aclPropagate,
+			Roles:     []string{aclEntry[mkResourceVirtualEnvironmentGroupACLRoleID].(string)},
+		}
+
+		err = client.Access().UpdateACL(ctx, aclBody)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
+	err = client.Access().DeleteGroup(ctx, groupID)
+
+	if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
+		return diag.FromErr(err)
+	}
+
+	d.SetId("")
+
+	return nil
+}

@@ -1,0 +1,112 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package cluster
+
+import (
+	"fmt"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/acme"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/backup"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/ceph"
+	clusterfirewall "github.com/bpg/terraform-provider-proxmox/proxmox/cluster/firewall"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/ha"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/mapping"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/metrics"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/replications"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/applier"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/controllers"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/fabric_nodes"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/fabrics"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/vnets"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/zones"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/firewall"
+)
+
+// Client is an interface for accessing the Proxmox cluster API.
+type Client struct {
+	api.Client
+}
+
+// ExpandPath expands a relative path to a full cluster API path.
+func (c *Client) ExpandPath(path string) string {
+	return fmt.Sprintf("cluster/%s", path)
+}
+
+// Firewall returns a client for managing the cluster firewall.
+func (c *Client) Firewall() clusterfirewall.API {
+	return &clusterfirewall.Client{
+		Client: firewall.Client{Client: c},
+	}
+}
+
+// HA returns a client for managing the cluster's High Availability features.
+func (c *Client) HA() *ha.Client {
+	return &ha.Client{Client: c}
+}
+
+// HardwareMapping returns a client for managing the cluster's hardware mapping features.
+func (c *Client) HardwareMapping() *mapping.Client {
+	return &mapping.Client{Client: c}
+}
+
+// ACME returns a client for managing the cluster's ACME features.
+func (c *Client) ACME() *acme.Client {
+	return &acme.Client{Client: c}
+}
+
+// Backup returns a client for managing cluster backup jobs.
+func (c *Client) Backup() *backup.Client {
+	return &backup.Client{Client: c}
+}
+
+// Ceph returns a client for managing the cluster's Ceph resources.
+func (c *Client) Ceph() *ceph.Client {
+	return &ceph.Client{Client: c}
+}
+
+// Metrics returns a client for managing the cluster's metrics features.
+func (c *Client) Metrics() *metrics.Client {
+	return &metrics.Client{Client: c}
+}
+
+// SDNZones returns a client for managing the cluster's SDN zones.
+func (c *Client) SDNZones() *zones.Client {
+	return &zones.Client{Client: c}
+}
+
+// SDNVnets returns a client for managing the cluster's SDN Vnets.
+// id is the identifier of the Vnet to manage.
+func (c *Client) SDNVnets(id string) *vnets.Client {
+	return &vnets.Client{Client: c, ID: id}
+}
+
+// SDNFabrics returns a client for managing the cluster's SDN fabrics.
+func (c *Client) SDNFabrics(protocol string) *fabrics.Client {
+	return &fabrics.Client{Client: c, Protocol: protocol}
+}
+
+// SDNFabricNodes returns a client for managing the cluster's SDN fabric nodes.
+func (c *Client) SDNFabricNodes(fabricID, protocol string) *fabric_nodes.Client {
+	return &fabric_nodes.Client{Client: c, FabricID: fabricID, FabricProtocol: protocol}
+}
+
+// SDNApplier returns a client for applying the SDN's configuration.
+func (c *Client) SDNApplier() *applier.Client {
+	return &applier.Client{Client: c}
+}
+
+// SDNControllers returns a client for managing the cluster's SDN controllers.
+func (c *Client) SDNControllers() *controllers.Client {
+	return &controllers.Client{Client: c}
+}
+
+// Replication returns a client for managing the cluster's Storage Replication.
+// id is the identifier of the Replication to manage.
+func (c *Client) Replication(id string) *replications.Client {
+	return &replications.Client{Client: c, ID: id}
+}

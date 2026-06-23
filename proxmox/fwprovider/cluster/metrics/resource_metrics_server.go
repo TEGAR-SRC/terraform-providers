@@ -1,0 +1,460 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package metrics
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/migration"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/metrics"
+)
+
+var (
+	_ resource.Resource                = &metricsServerResource{}
+	_ resource.ResourceWithConfigure   = &metricsServerResource{}
+	_ resource.ResourceWithImportState = &metricsServerResource{}
+)
+
+type metricsServerResource struct {
+	client *metrics.Client
+}
+
+// NewMetricsServerResource creates new metrics server resource.
+func NewMetricsServerResource() resource.Resource {
+	return &metricsServerResource{}
+}
+
+func (r *metricsServerResource) Metadata(
+	_ context.Context,
+	req resource.MetadataRequest,
+	resp *resource.MetadataResponse,
+) {
+	resp.TypeName = req.ProviderTypeName + "_metrics_server"
+}
+
+func (r *metricsServerResource) Configure(
+	_ context.Context,
+	req resource.ConfigureRequest,
+	resp *resource.ConfigureResponse,
+) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.Resource)
+
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected *proxmox.Client, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	r.client = cfg.Client.Cluster().Metrics()
+}
+
+func (r *metricsServerResource) Schema(
+	_ context.Context,
+	_ resource.SchemaRequest,
+	resp *resource.SchemaResponse,
+) {
+	resp.Schema = schema.Schema{
+		DeprecationMessage: migration.DeprecationMessage("proxmox_metrics_server"),
+		Description:        "Manages PVE metrics server.",
+		Attributes: map[string]schema.Attribute{
+			"id": attribute.ResourceID(),
+			"name": schema.StringAttribute{
+				Description: "Unique name that will be ID of this metric server in PVE.",
+				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"disable": schema.BoolAttribute{
+				Description: "Set this to `true` to disable this metric server. Defaults to `false`.",
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(false),
+			},
+			"mtu": schema.Int64Attribute{
+				Description: "MTU (maximum transmission unit) for metrics transmission over UDP. " +
+					"If not set, PVE default is `1500` (allowed `512` - `65536`).",
+				Validators: []validator.Int64{int64validator.Between(512, 65536)},
+				Optional:   true,
+				Default:    nil,
+			},
+			"port": schema.Int64Attribute{
+				Description: "Server network port.",
+				Required:    true,
+				Validators:  []validator.Int64{int64validator.Between(1, 65536)},
+			},
+			"server": schema.StringAttribute{
+				Description: "Server dns name or IP address.",
+				Required:    true,
+			},
+			"timeout": schema.Int64Attribute{
+				Description: "TCP socket timeout in seconds. If not set, PVE default is `1`.",
+				Optional:    true,
+				Default:     nil,
+			},
+			"type": schema.StringAttribute{
+				Description: "Plugin type. Choice is between `graphite` | `influxdb` | `opentelemetry`.",
+				Required:    true,
+				Validators:  []validator.String{stringvalidator.OneOf("graphite", "influxdb", "opentelemetry")},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"influx_api_path_prefix": schema.StringAttribute{
+				Description: "An API path prefix inserted between `<host>:<port>/` and `/api2/`." +
+					" Can be useful if the InfluxDB service runs behind a reverse proxy.",
+				Optional: true,
+				Default:  nil,
+			},
+			"influx_bucket": schema.StringAttribute{
+				Description: "The InfluxDB bucket/db. Only necessary when using the http v2 api.",
+				Optional:    true,
+				Default:     nil,
+			},
+			"influx_db_proto": schema.StringAttribute{
+				Description: "Protocol for InfluxDB. Choice is between `udp` | `http` | `https`. " +
+					"If not set, PVE default is `udp`.",
+				Validators: []validator.String{stringvalidator.OneOf("udp", "http", "https")},
+				Optional:   true,
+				Default:    nil,
+			},
+			"influx_max_body_size": schema.Int64Attribute{
+				Description: "InfluxDB max-body-size in bytes. Requests are batched up to this " +
+					"size. If not set, PVE default is `25000000`.",
+				Optional: true,
+				Default:  nil,
+			},
+			"influx_organization": schema.StringAttribute{
+				Description: "The InfluxDB organization. Only necessary when using the http v2 " +
+					"api. Has no meaning when using v2 compatibility api.",
+				Optional: true,
+				Default:  nil,
+			},
+			"influx_token": schema.StringAttribute{
+				Description: "The InfluxDB access token. Only necessary when using the http v2 " +
+					"api. If the v2 compatibility api is used, use `user:password` instead.",
+				Optional:  true,
+				Default:   nil,
+				Sensitive: true,
+			},
+			"influx_verify": schema.BoolAttribute{
+				Description: "Set to `false` to disable certificate verification for https " +
+					"endpoints. If not set, PVE default is `true`.",
+				Optional: true,
+			},
+			"graphite_path": schema.StringAttribute{
+				Description: "Root graphite path (ex: `proxmox.mycluster.mykey`).",
+				Optional:    true,
+				Default:     nil,
+			},
+			"graphite_proto": schema.StringAttribute{
+				Description: "Protocol to send graphite data. Choice is between `udp` | `tcp`. " +
+					"If not set, PVE default is `udp`.",
+				Validators: []validator.String{stringvalidator.OneOf("udp", "tcp")},
+				Optional:   true,
+				Default:    nil,
+			},
+			"opentelemetry_proto": schema.StringAttribute{
+				Description: "Protocol for OpenTelemetry. Choice is between `http` | `https`. " +
+					"If not set, PVE default is `https`.",
+				Validators: []validator.String{stringvalidator.OneOf("http", "https")},
+				Optional:   true,
+				Default:    nil,
+			},
+			"opentelemetry_path": schema.StringAttribute{
+				Description: "OpenTelemetry endpoint path (e.g., `/v1/metrics`).",
+				Optional:    true,
+				Default:     nil,
+			},
+			"opentelemetry_timeout": schema.Int64Attribute{
+				Description: "OpenTelemetry HTTP request timeout in seconds. " +
+					"If not set, PVE default is `5`.",
+				Validators: []validator.Int64{int64validator.Between(1, 10)},
+				Optional:   true,
+				Default:    nil,
+			},
+			"opentelemetry_headers": schema.StringAttribute{
+				Description: "OpenTelemetry custom HTTP headers as JSON, base64 encoded.",
+				Validators:  []validator.String{stringvalidator.LengthAtMost(1024)},
+				Optional:    true,
+				Sensitive:   true,
+				Default:     nil,
+			},
+			"opentelemetry_verify_ssl": schema.BoolAttribute{
+				Description: "OpenTelemetry verify SSL certificates. " +
+					"If not set, PVE default is `true`.",
+				Optional: true,
+			},
+			"opentelemetry_max_body_size": schema.Int64Attribute{
+				Description: "OpenTelemetry maximum request body size in bytes. " +
+					"If not set, PVE default is `10000000`.",
+				Validators: []validator.Int64{int64validator.AtLeast(1024)},
+				Optional:   true,
+				Default:    nil,
+			},
+			"opentelemetry_resource_attributes": schema.StringAttribute{
+				Description: "OpenTelemetry additional resource attributes as JSON, base64 encoded.",
+				Validators:  []validator.String{stringvalidator.LengthAtMost(1024)},
+				Optional:    true,
+				Default:     nil,
+			},
+			"opentelemetry_compression": schema.StringAttribute{
+				Description: "OpenTelemetry compression algorithm for requests. Choice is between `none` | `gzip`. " +
+					"If not set, PVE default is `gzip`.",
+				Validators: []validator.String{stringvalidator.OneOf("none", "gzip")},
+				Optional:   true,
+				Default:    nil,
+			},
+		},
+	}
+}
+
+func (r *metricsServerResource) Read(
+	ctx context.Context,
+	req resource.ReadRequest,
+	resp *resource.ReadResponse,
+) {
+	var state metricsServerModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	data, err := r.client.GetServer(ctx, state.ID.ValueString())
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.State.RemoveResource(ctx)
+
+			return
+		}
+
+		resp.Diagnostics.AddError("Unable to Read Metrics Server", err.Error())
+
+		return
+	}
+
+	readModel := &metricsServerModel{}
+	readModel.fromAPI(state.ID.ValueString(), data)
+	// PVE omits verify-certificate / otel-verify-ssl from GET responses when they equal
+	// the server default; preserve the prior state so we don't churn them to null.
+	preserveTypeSpecificBools(readModel, &state)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, readModel)...)
+}
+
+func (r *metricsServerResource) Create(
+	ctx context.Context,
+	req resource.CreateRequest,
+	resp *resource.CreateResponse,
+) {
+	var plan metricsServerModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	err := r.client.CreateServer(ctx, plan.toAPI())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Create Metrics Server", err.Error())
+		return
+	}
+
+	data, err := r.client.GetServer(ctx, plan.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Read Metrics Server After Creation", err.Error())
+		return
+	}
+
+	readModel := &metricsServerModel{}
+	readModel.fromAPI(plan.Name.ValueString(), data)
+	// PVE omits verify-certificate / otel-verify-ssl from GET responses when they equal
+	// the server default; preserve the plan so explicit values survive the round-trip.
+	preserveTypeSpecificBools(readModel, &plan)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, readModel)...)
+}
+
+func (r *metricsServerResource) Update(
+	ctx context.Context,
+	req resource.UpdateRequest,
+	resp *resource.UpdateResponse,
+) {
+	var plan metricsServerModel
+
+	var state metricsServerModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var toDelete []string
+
+	attribute.CheckDelete(plan.Disable, state.Disable, &toDelete, "disable")
+	attribute.CheckDelete(plan.MTU, state.MTU, &toDelete, "mtu")
+	attribute.CheckDelete(plan.Timeout, state.Timeout, &toDelete, "timeout")
+	attribute.CheckDelete(plan.InfluxAPIPathPrefix, state.InfluxAPIPathPrefix, &toDelete, "api-path-prefix")
+	attribute.CheckDelete(plan.InfluxBucket, state.InfluxBucket, &toDelete, "bucket")
+	attribute.CheckDelete(plan.InfluxDBProto, state.InfluxDBProto, &toDelete, "influxdbproto")
+	attribute.CheckDelete(plan.InfluxMaxBodySize, state.InfluxMaxBodySize, &toDelete, "max-body-size")
+	attribute.CheckDelete(plan.InfluxOrganization, state.InfluxOrganization, &toDelete, "organization")
+	attribute.CheckDelete(plan.InfluxToken, state.InfluxToken, &toDelete, "token")
+	attribute.CheckDelete(plan.InfluxVerify, state.InfluxVerify, &toDelete, "verify-certificate")
+	attribute.CheckDelete(plan.GraphitePath, state.GraphitePath, &toDelete, "path")
+	attribute.CheckDelete(plan.GraphiteProto, state.GraphiteProto, &toDelete, "proto")
+	attribute.CheckDelete(plan.OTelProto, state.OTelProto, &toDelete, "otel-protocol")
+	attribute.CheckDelete(plan.OTelPath, state.OTelPath, &toDelete, "otel-path")
+	attribute.CheckDelete(plan.OTelTimeout, state.OTelTimeout, &toDelete, "otel-timeout")
+	attribute.CheckDelete(plan.OTelHeaders, state.OTelHeaders, &toDelete, "otel-headers")
+	attribute.CheckDelete(plan.OTelVerifySSL, state.OTelVerifySSL, &toDelete, "otel-verify-ssl")
+	attribute.CheckDelete(plan.OTelMaxBodySize, state.OTelMaxBodySize, &toDelete, "otel-max-body-size")
+	attribute.CheckDelete(plan.OTelResourceAttributes, state.OTelResourceAttributes, &toDelete, "otel-resource-attributes")
+	attribute.CheckDelete(plan.OTelCompression, state.OTelCompression, &toDelete, "otel-compression")
+
+	reqData := plan.toAPI()
+	reqData.Delete = toDelete
+
+	err := r.client.UpdateServer(ctx, reqData)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Update Metrics Server", err.Error())
+		return
+	}
+
+	data, err := r.client.GetServer(ctx, plan.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Read Metrics Server After Update", err.Error())
+		return
+	}
+
+	readModel := &metricsServerModel{}
+	readModel.fromAPI(plan.Name.ValueString(), data)
+	// PVE omits verify-certificate / otel-verify-ssl from GET responses when they equal
+	// the server default; preserve the plan so explicit values survive the round-trip.
+	preserveTypeSpecificBools(readModel, &plan)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, readModel)...)
+}
+
+func (r *metricsServerResource) Delete(
+	ctx context.Context,
+	req resource.DeleteRequest,
+	resp *resource.DeleteResponse,
+) {
+	var state metricsServerModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	err := r.client.DeleteServer(ctx, state.ID.ValueString())
+	if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
+		resp.Diagnostics.AddError("Unable to Delete Metrics Server", err.Error())
+	}
+}
+
+func (r *metricsServerResource) ImportState(
+	ctx context.Context,
+	req resource.ImportStateRequest,
+	resp *resource.ImportStateResponse,
+) {
+	data, err := r.client.GetServer(ctx, req.ID)
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.Diagnostics.AddError(
+				"Metrics Server Not Found",
+				fmt.Sprintf("Metrics server with ID %q was not found", req.ID),
+			)
+
+			return
+		}
+
+		resp.Diagnostics.AddError("Unable to Import Metrics Server", err.Error())
+
+		return
+	}
+
+	readModel := &metricsServerModel{}
+	readModel.fromAPI(req.ID, data)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, readModel)...)
+}
+
+// Short-name alias for the metrics server resource (ADR-007).
+
+var (
+	_ resource.Resource                = &metricsServerResourceShort{}
+	_ resource.ResourceWithConfigure   = &metricsServerResourceShort{}
+	_ resource.ResourceWithImportState = &metricsServerResourceShort{}
+	_ resource.ResourceWithMoveState   = &metricsServerResourceShort{}
+)
+
+type metricsServerResourceShort struct {
+	metricsServerResource
+}
+
+// NewMetricsServerShortResource creates a short-name alias for the metrics server resource.
+func NewMetricsServerShortResource() resource.Resource {
+	return &metricsServerResourceShort{}
+}
+
+func (r *metricsServerResourceShort) Metadata(
+	_ context.Context,
+	_ resource.MetadataRequest,
+	resp *resource.MetadataResponse,
+) {
+	resp.TypeName = "proxmox_metrics_server"
+}
+
+func (r *metricsServerResourceShort) Schema(
+	ctx context.Context,
+	req resource.SchemaRequest,
+	resp *resource.SchemaResponse,
+) {
+	r.metricsServerResource.Schema(ctx, req, resp)
+	resp.Schema.DeprecationMessage = ""
+}
+
+func (r *metricsServerResourceShort) MoveState(ctx context.Context) []resource.StateMover {
+	schemaResp := &resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, schemaResp)
+
+	return []resource.StateMover{
+		migration.PrefixMoveState(
+			"proxmox_virtual_environment_metrics_server",
+			&schemaResp.Schema,
+		),
+	}
+}

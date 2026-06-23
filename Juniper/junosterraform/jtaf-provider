@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import xml.etree.ElementTree as ElementTree
+from copy import copy
+import json
+import argparse
+import sys
+from jinja2 import Template
+import os
+import shutil
+import os
+from importlib.resources import files, as_file
+from junosterraform.jtaf_common import filter_json_using_xml, load_and_merge_xmls
+
+ 
+def render_template_and_write(input_template: str, output_file: str, context: dict, description: str):
+    with open(input_template) as f:
+        tmpl = Template(f.read())
+    rendered = tmpl.render(data=context).lstrip()
+    with open(output_file, "w") as f:
+        f.write(rendered)
+    print(f"Updated {description}")
+
+
+def rewrite_import_prefixes(go_dir: str, old_prefix: str, new_prefix: str):
+    """Replace module import prefixes across copied Go files in place."""
+    for root, _, files in os.walk(go_dir):
+        for filename in files:
+            if not filename.endswith(".go"):
+                continue
+            full_path = os.path.join(root, filename)
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            updated = content.replace(f'"{old_prefix}/', f'"{new_prefix}/')
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+
+
+def ensure_go_module_name(go_mod_path: str, module_name: str):
+    """Ensure go.mod has the expected module directive."""
+    with open(go_mod_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith("module "):
+            expected = f"module {module_name}\n"
+            if line != expected:
+                lines[i] = expected
+                updated = True
+            break
+
+    if updated:
+        with open(go_mod_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+
+# Main Method
+def main():
+    # other arguments
+    parser = argparse.ArgumentParser(
+        description='Generate a Terraform provider from JTAF JSON and XML config.',
+        exit_on_error=True,
+    )
+    parser.add_argument(
+        '-j',
+        '--json-schema',
+        required=True,
+        help="Path to JTAF JSON schema, or '-' to read JSON from stdin.",
+    )
+    parser.add_argument(
+        '-x',
+        '--xml-config',
+        required=True,
+        action='append',
+        nargs="+",
+        help='One or more Junos XML config files to merge/filter against schema.',
+    )
+    parser.add_argument(
+        '-t',
+        '--type',
+        required=True,
+        help='Device type suffix used in output directory name.',
+    )
+    args = parser.parse_args()
+
+    # Merge XML files if multiple are provided 
+    xml_files = [file for group in args.xml_config for file in group]
+    xml_config = xml_files[0] if len(xml_files) == 1 else load_and_merge_xmls(xml_files)
+
+    # Step 1: Filter the schema using the config
+    resources = filter_json_using_xml(args.json_schema, xml_config)
+
+    # Step 2: Render the template into Go code
+    with as_file(files('junosterraform').joinpath('__init__.py')) as init_py:
+        package_dir = os.path.dirname(init_py)
+    templates_dir = f"{package_dir}/templates"
+    with open(f"{templates_dir}/resource_config_provider.go.j2") as f:
+        jinja2_source = f.read()
+    tmpl = Template(jinja2_source)
+    render_context = dict(resources)
+    render_context["device_type"] = args.type
+    resource_config_provider_go = tmpl.render(data=render_context).lstrip()
+
+    # Step 3: Prepare new output directory based on type
+    with as_file(files('terraform_provider').joinpath('__init__.py')) as init_py:
+        go_dir = os.path.dirname(init_py)
+    new_dir = f"terraform-provider-junos-{args.type}"
+
+    # Step 4: copy the template go files into place
+    if os.path.exists(new_dir):
+        shutil.rmtree(new_dir)
+    # Exclude directories that should not be in generated providers
+    def _ignore_dirs(directory, contents):
+        ignored = set()
+        if directory == go_dir:
+            for item in contents:
+                if item in ('tools', '__pycache__'):
+                    ignored.add(item)
+        return ignored
+    shutil.copytree(go_dir, new_dir, ignore=_ignore_dirs)
+    # if there is a terraform_provider executable left over from go testing, remove it
+    tp_exe = f"{new_dir}/terraform_provider"
+    if os.path.exists(tp_exe):
+        os.remove(tp_exe)
+
+    # Step 5: Save rendered Go file into new directory
+    resource_config_provider_go_fullpath = os.path.join(new_dir, "resource_config_provider.go")
+    with open(resource_config_provider_go_fullpath, "w") as f:
+        f.write(resource_config_provider_go)
+    print(f"Plugin created in {os.path.relpath(resource_config_provider_go_fullpath)}\n")
+
+    # Step 6-8: Update provider.go, go.mod, and config.go with correct type using a loop
+    files_to_update = [
+        ("provider.go.j2", "provider.go"),
+        ("go.mod.j2", "go.mod"),
+        ("config.go.j2", "config.go"),
+    ]
+    for template_name, output_name in files_to_update:
+        with open(f"{templates_dir}/{template_name}") as f:
+            jinja2_source = f.read()
+        tmpl = Template(jinja2_source)
+        rendered = tmpl.render(data={"device_type": args.type}).lstrip()
+        output_path = os.path.join(new_dir, output_name)
+        with open(output_path, "w") as f:
+            f.write(rendered)
+        print(f"Updated {output_name} with type junos-{args.type}")
+
+    expected_module = f"terraform-provider-junos-{args.type}"
+    go_mod_path = os.path.join(new_dir, "go.mod")
+    ensure_go_module_name(go_mod_path, expected_module)
+
+    # Step 8: Normalize import prefixes in copied Go files (including tests).
+    rewrite_import_prefixes(new_dir, "terraform_provider", expected_module)
+
+    # Step 7: Add trimmed_schema.json to new directory
+    trimmed_schema_path = os.path.join(new_dir, "trimmed_schema.json")
+    with open(trimmed_schema_path, "w") as f:
+        json.dump(resources, f, indent=2)
+
+# run main()
+if __name__ == "__main__":
+    main()

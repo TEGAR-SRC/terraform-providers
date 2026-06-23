@@ -1,0 +1,459 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/iancoleman/strcase"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/internal/serverutil"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/cloudapinic"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+)
+
+func dataSourceServers() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceServersRead,
+		Schema: map[string]*schema.Schema{
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+			},
+			"filter": dataSourceFiltersSchema(),
+			"servers": {
+				Type:        schema.TypeList,
+				Description: "list of servers",
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"template_uuid": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"id": {
+							Type:        schema.TypeString,
+							Description: "The unique ID of the server.",
+							Computed:    true,
+						},
+						"name": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"hostname": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"cores": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"ram": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"type": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"availability_zone": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"vm_state": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"cpu_family": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"boot_cdrom": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"boot_volume": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"boot_image": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"token": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"cdroms": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem:     serverutil.CdromsServerDSResource,
+						},
+						"volumes": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"id": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"name": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"disk_type": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"size": {
+										Type:     schema.TypeInt,
+										Computed: true,
+									},
+									"availability_zone": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"image_name": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"image_password": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"ssh_keys": {
+										Type:     schema.TypeList,
+										Computed: true,
+										Elem: &schema.Schema{
+											Type: schema.TypeString,
+										},
+									},
+									"bus": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"licence_type": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"cpu_hot_plug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"ram_hot_plug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"nic_hot_plug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"nic_hot_unplug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"disc_virtio_hot_plug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"disc_virtio_hot_unplug": {
+										Type:     schema.TypeBool,
+										Computed: true,
+									},
+									"device_number": {
+										Type:     schema.TypeInt,
+										Computed: true,
+									},
+									"pci_slot": {
+										Type:     schema.TypeInt,
+										Computed: true,
+									},
+									"backup_unit_id": {
+										Type:     schema.TypeString,
+										Computed: true,
+									},
+									"user_data": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"boot_server": {
+										Type:        schema.TypeString,
+										Description: "The UUID of the attached server.",
+										Computed:    true,
+									},
+									"expose_serial": {
+										Type:     schema.TypeBool,
+										Computed: true,
+										Description: "If set to `true` will expose the serial id of the disk attached to the server. " +
+											"If set to `false` will not expose the serial id. Some operating systems or software solutions require the serial id to be exposed to work properly. " +
+											"Exposing the serial can influence licensed software (e.g. Windows) behavior",
+									},
+									"require_legacy_bios": {
+										Type:        schema.TypeBool,
+										Computed:    true,
+										Description: "Indicates if the image requires the legacy BIOS for compatibility or specific needs.",
+									},
+								},
+							},
+						},
+						"nics": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem:     serverutil.NicServerDSResource,
+						},
+						"labels": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem:     labelDataSource,
+						},
+						"nic_multi_queue": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceFiltersSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:     schema.TypeSet,
+		Optional: true,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"name": {
+					Type:     schema.TypeString,
+					Required: true,
+				},
+				"value": {
+					Type:     schema.TypeString,
+					Required: true,
+				},
+			},
+		},
+	}
+}
+
+func dataSourceServersRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	datacenterID, dcIDOk := d.GetOk("datacenter_id")
+	if !dcIDOk {
+		return diagutil.ToDiags(d, fmt.Errorf("no datacenter_id was specified"), nil)
+	}
+	req := client.ServersApi.DatacentersServersGet(ctx, datacenterID.(string)).Depth(5)
+	filters, filtersOk := d.GetOk("filter")
+	if filtersOk {
+		for _, v := range filters.(*schema.Set).List() {
+			filter := v.(map[string]any)
+			// we want to convert for example cpu_family to cpuFamily
+			name := strcase.ToLowerCamel(filter["name"].(string))
+			value := filter["value"].(string)
+			req = req.Filter(name, value)
+			tflog.Info(ctx, "adding server filter", map[string]any{"name": name, "value": value})
+		}
+	}
+	var apiResponse *ionoscloud.APIResponse
+
+	/* search by whatever filter is set above */
+	servers, apiResponse, err := req.Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching servers: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	serverEntry := make(map[string]any)
+	var serversIntf []any
+
+	if d.Id() == "" {
+		d.SetId(datacenterID.(string))
+	}
+	for _, server := range *servers.Items {
+		serverEntry = SetServerProperties(server)
+		utils.SetPropWithNilCheck(serverEntry, "id", server.Id)
+		// todo: Add token?
+		if server.Entities != nil {
+			if server.Entities.Nics != nil && server.Entities.Nics.Items != nil {
+				nicItems := server.Entities.Nics.Items
+				if nicItems != nil && len(*nicItems) > 0 {
+					var nics []any
+					for _, nic := range *server.Entities.Nics.Items {
+						nicMap := cloudapinic.SetNetworkProperties(nic)
+						fw := setFirewallRules(nic)
+						nicMap["firewall_rules"] = fw
+						utils.SetPropWithNilCheck(nicMap, "id", nic.Id)
+						nics = append(nics, nicMap)
+					}
+					if len(nics) > 0 {
+						serverEntry["nics"] = nics
+					}
+				}
+			}
+			if server.Entities.Volumes != nil && server.Entities.Volumes.Items != nil {
+				volumes := setVolumePropertiesToSlice(*server.Entities.Volumes.Items)
+				if volumes != nil && len(volumes) > 0 {
+					serverEntry["volumes"] = volumes
+				}
+			}
+			if server.Entities.Cdroms != nil {
+				if server.Entities.Cdroms.Items != nil && len(*server.Entities.Cdroms.Items) > 0 {
+					cdroms := setServerCDRoms(server.Entities.Cdroms.Items)
+					if cdroms != nil && len(cdroms) > 0 {
+						serverEntry["cdroms"] = cdroms
+					}
+				}
+			}
+
+			if server.Id == nil {
+				return diagutil.ToDiags(d, fmt.Errorf("expected a valid server ID from the API but received nil instead"), nil)
+			}
+			// Labels logic
+			ls := LabelsService{ctx: ctx, client: client}
+			labels, err := ls.datacentersServersLabelsGet(datacenterID.(string), *server.Id, true)
+			if err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+			serverEntry["labels"] = labels
+		}
+		serversIntf = append(serversIntf, serverEntry)
+	}
+	if serversIntf == nil || len(serversIntf) == 0 {
+		return diagutil.ToDiags(d, fmt.Errorf("no servers found for criteria, please check your filter configuration"), nil)
+	}
+	err = d.Set("servers", &serversIntf)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error while setting servers: %w", err), nil)
+	}
+
+	return nil
+}
+
+// setVolumePropertiesToSlice returns a slice of volumes
+func setVolumePropertiesToSlice(volumesList []ionoscloud.Volume) []any {
+	var volumes []any
+	if volumesList != nil && len(volumesList) > 0 {
+		for _, volume := range volumesList {
+			volumeItemMap := SetVolumeProperties(volume)
+			utils.SetPropWithNilCheck(volumeItemMap, "id", volume.Id)
+			volumes = append(volumes, volumeItemMap)
+		}
+	}
+	return volumes
+}
+func setFirewallRules(nic ionoscloud.Nic) []any {
+	var firewallRules []any
+	if nic.Entities != nil && nic.Entities.Firewallrules != nil && nic.Entities.Firewallrules.Items != nil {
+		for _, rule := range *nic.Entities.Firewallrules.Items {
+			ruleEntry := setFirewallRuleProperties(rule)
+			firewallRules = append(firewallRules, ruleEntry)
+		}
+	}
+	return firewallRules
+}
+
+func setFirewallRuleProperties(rule ionoscloud.FirewallRule) map[string]any {
+	ruleEntry := make(map[string]any)
+	ruleEntry["id"] = shared.ToValueDefault(rule.Id)
+	if rule.Properties != nil {
+		ruleEntry["name"] = shared.ToValueDefault(rule.Properties.Name)
+		ruleEntry["protocol"] = shared.ToValueDefault(rule.Properties.Protocol)
+		ruleEntry["source_mac"] = shared.ToValueDefault(rule.Properties.SourceMac)
+		ruleEntry["source_ip"] = shared.ToValueDefault(rule.Properties.SourceIp)
+		ruleEntry["target_ip"] = shared.ToValueDefault(rule.Properties.TargetIp)
+		ruleEntry["icmp_code"] = int32OrDefault(rule.Properties.IcmpCode, 0)
+		ruleEntry["icmp_type"] = int32OrDefault(rule.Properties.IcmpType, 0)
+		ruleEntry["port_range_start"] = int32OrDefault(rule.Properties.PortRangeStart, 0)
+		ruleEntry["port_range_end"] = int32OrDefault(rule.Properties.PortRangeEnd, 0)
+		ruleEntry["type"] = shared.ToValueDefault(rule.Properties.Type)
+	}
+	return ruleEntry
+}
+
+func SetServerProperties(server ionoscloud.Server) map[string]any {
+	serverMap := map[string]any{}
+	if server.Properties != nil {
+		utils.SetPropWithNilCheck(serverMap, "template_uuid", server.Properties.TemplateUuid)
+		utils.SetPropWithNilCheck(serverMap, "name", server.Properties.Name)
+		utils.SetPropWithNilCheck(serverMap, "hostname", server.Properties.Hostname)
+		utils.SetPropWithNilCheck(serverMap, "cores", server.Properties.Cores)
+		utils.SetPropWithNilCheck(serverMap, "ram", server.Properties.Ram)
+		utils.SetPropWithNilCheck(serverMap, "availability_zone", server.Properties.AvailabilityZone)
+		utils.SetPropWithNilCheck(serverMap, "cpu_family", server.Properties.CpuFamily)
+		utils.SetPropWithNilCheck(serverMap, "type", server.Properties.Type)
+		utils.SetPropWithNilCheck(serverMap, "nic_multi_queue", server.Properties.NicMultiQueue)
+		if server.Properties.BootCdrom != nil && server.Properties.BootCdrom.Id != nil {
+			utils.SetPropWithNilCheck(serverMap, "boot_cdrom", *server.Properties.BootCdrom.Id)
+		}
+
+		if server.Properties.BootVolume != nil && server.Properties.BootVolume.Id != nil {
+			utils.SetPropWithNilCheck(serverMap, "boot_volume", *server.Properties.BootVolume.Id)
+
+		}
+		if server.Entities != nil && server.Entities.Volumes != nil && server.Entities.Volumes.Items != nil && len(*server.Entities.Volumes.Items) > 0 &&
+			(*server.Entities.Volumes.Items)[0].Properties.Image != nil {
+			utils.SetPropWithNilCheck(serverMap, "boot_image", (*server.Entities.Volumes.Items)[0].Properties.Image)
+		}
+	}
+	return serverMap
+}
+
+func setServerCDRoms(images *[]ionoscloud.Image) []any {
+	var cdroms []any
+	for _, image := range *images {
+		entry := make(map[string]any)
+
+		entry["id"] = shared.ToValueDefault(image.Id)
+		entry["name"] = shared.ToValueDefault(image.Properties.Name)
+		entry["description"] = shared.ToValueDefault(image.Properties.Description)
+		entry["location"] = shared.ToValueDefault(image.Properties.Location)
+		entry["size"] = float32OrDefault(image.Properties.Size, 0)
+		entry["cpu_hot_plug"] = boolOrDefault(image.Properties.CpuHotPlug, true)
+		entry["cpu_hot_unplug"] = boolOrDefault(image.Properties.CpuHotUnplug, true)
+		entry["ram_hot_plug"] = boolOrDefault(image.Properties.RamHotPlug, true)
+		entry["ram_hot_unplug"] = boolOrDefault(image.Properties.RamHotUnplug, true)
+		entry["nic_hot_plug"] = boolOrDefault(image.Properties.NicHotPlug, true)
+		entry["nic_hot_unplug"] = boolOrDefault(image.Properties.NicHotUnplug, true)
+		entry["disc_virtio_hot_plug"] = boolOrDefault(image.Properties.DiscVirtioHotPlug, true)
+		entry["disc_virtio_hot_unplug"] = boolOrDefault(image.Properties.DiscVirtioHotUnplug, true)
+		entry["disc_scsi_hot_plug"] = boolOrDefault(image.Properties.DiscScsiHotPlug, true)
+		entry["disc_scsi_hot_unplug"] = boolOrDefault(image.Properties.DiscScsiHotUnplug, true)
+		entry["licence_type"] = shared.ToValueDefault(image.Properties.LicenceType)
+		entry["image_type"] = shared.ToValueDefault(image.Properties.ImageType)
+		entry["public"] = boolOrDefault(image.Properties.Public, false)
+
+		if image.Properties.ImageAliases != nil {
+			var imageAliases []any
+			for _, imageAlias := range *image.Properties.ImageAliases {
+				imageAliases = append(imageAliases, imageAlias)
+			}
+			entry["image_aliases"] = imageAliases
+		}
+
+		entry["cloud_init"] = shared.ToValueDefault(image.Properties.CloudInit)
+
+		cdroms = append(cdroms, entry)
+	}
+	return cdroms
+}

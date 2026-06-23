@@ -1,0 +1,205 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package metrics
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/migration"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/metrics"
+)
+
+// Ensure the implementation satisfies the expected interfaces.
+var (
+	_ datasource.DataSource              = &metricsServerDatasource{}
+	_ datasource.DataSourceWithConfigure = &metricsServerDatasource{}
+)
+
+type metricsServerDatasource struct {
+	client *metrics.Client
+}
+
+// NewMetricsServerDatasource creates new metrics server data source.
+func NewMetricsServerDatasource() datasource.DataSource {
+	return &metricsServerDatasource{}
+}
+
+func (r *metricsServerDatasource) Metadata(
+	_ context.Context,
+	req datasource.MetadataRequest,
+	resp *datasource.MetadataResponse,
+) {
+	resp.TypeName = req.ProviderTypeName + "_metrics_server"
+}
+
+func (r *metricsServerDatasource) Configure(
+	_ context.Context,
+	req datasource.ConfigureRequest,
+	resp *datasource.ConfigureResponse,
+) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.DataSource)
+
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected *proxmox.Client, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	r.client = cfg.Client.Cluster().Metrics()
+}
+
+func (r *metricsServerDatasource) Schema(
+	_ context.Context,
+	_ datasource.SchemaRequest,
+	resp *datasource.SchemaResponse,
+) {
+	resp.Schema = schema.Schema{
+		DeprecationMessage: migration.DeprecationMessage("proxmox_metrics_server"),
+		Description:        "Retrieves information about a specific PVE metric server.",
+		Attributes: map[string]schema.Attribute{
+			"id": attribute.ResourceID(),
+			"name": schema.StringAttribute{
+				Description: "Unique name that will be ID of this metric server in PVE.",
+				Required:    true,
+			},
+			"disable": schema.BoolAttribute{
+				Description: "Indicates if the metric server is disabled.",
+				Computed:    true,
+			},
+			"port": schema.Int64Attribute{
+				Description: "Server network port.",
+				Computed:    true,
+			},
+			"server": schema.StringAttribute{
+				Description: "Server dns name or IP address.",
+				Computed:    true,
+			},
+			"type": schema.StringAttribute{
+				Description: "Plugin type. Either `graphite`, `influxdb`, or `opentelemetry`.",
+				Computed:    true,
+			},
+			"opentelemetry_proto": schema.StringAttribute{
+				Description: "Protocol for OpenTelemetry. Choice is between `http` | `https`.",
+				Computed:    true,
+			},
+			"opentelemetry_path": schema.StringAttribute{
+				Description: "OpenTelemetry endpoint path (e.g., `/v1/metrics`).",
+				Computed:    true,
+			},
+			"opentelemetry_timeout": schema.Int64Attribute{
+				Description: "OpenTelemetry HTTP request timeout in seconds.",
+				Computed:    true,
+			},
+			"opentelemetry_headers": schema.StringAttribute{
+				Description: "OpenTelemetry custom HTTP headers as JSON, base64 encoded.",
+				Computed:    true,
+				Sensitive:   true,
+			},
+			"opentelemetry_verify_ssl": schema.BoolAttribute{
+				Description: "OpenTelemetry verify SSL certificates.",
+				Computed:    true,
+			},
+			"opentelemetry_max_body_size": schema.Int64Attribute{
+				Description: "OpenTelemetry maximum request body size in bytes.",
+				Computed:    true,
+			},
+			"opentelemetry_resource_attributes": schema.StringAttribute{
+				Description: "OpenTelemetry additional resource attributes as JSON, base64 encoded.",
+				Computed:    true,
+			},
+			"opentelemetry_compression": schema.StringAttribute{
+				Description: "OpenTelemetry compression algorithm for requests.",
+				Computed:    true,
+			},
+		},
+	}
+}
+
+func (r *metricsServerDatasource) Read(
+	ctx context.Context,
+	req datasource.ReadRequest,
+	resp *datasource.ReadResponse,
+) {
+	var state metricsServerDatasourceModel
+
+	resp.Diagnostics.Append(req.Config.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	state.ID = state.Name
+
+	data, err := r.client.GetServer(ctx, state.ID.ValueString())
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.Diagnostics.AddError(
+				"Metrics Server Not Found",
+				fmt.Sprintf("Metrics server with ID %q was not found", state.ID.ValueString()),
+			)
+
+			return
+		}
+
+		resp.Diagnostics.AddError("Unable to Read Metrics Server", err.Error())
+
+		return
+	}
+
+	readModel := &metricsServerDatasourceModel{}
+	readModel.fromAPI(state.ID.ValueString(), data)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, readModel)...)
+}
+
+// Short-name alias for the metrics server data source (ADR-007).
+
+var (
+	_ datasource.DataSource              = &metricsServerDatasourceShort{}
+	_ datasource.DataSourceWithConfigure = &metricsServerDatasourceShort{}
+)
+
+type metricsServerDatasourceShort struct {
+	metricsServerDatasource
+}
+
+// NewMetricsServerShortDatasource creates a short-name alias for the metrics server data source.
+func NewMetricsServerShortDatasource() datasource.DataSource {
+	return &metricsServerDatasourceShort{}
+}
+
+func (r *metricsServerDatasourceShort) Metadata(
+	_ context.Context,
+	_ datasource.MetadataRequest,
+	resp *datasource.MetadataResponse,
+) {
+	resp.TypeName = "proxmox_metrics_server"
+}
+
+func (r *metricsServerDatasourceShort) Schema(
+	ctx context.Context,
+	req datasource.SchemaRequest,
+	resp *datasource.SchemaResponse,
+) {
+	r.metricsServerDatasource.Schema(ctx, req, resp)
+	resp.Schema.DeprecationMessage = ""
+}

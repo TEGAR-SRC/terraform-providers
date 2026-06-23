@@ -1,0 +1,307 @@
+//go:build compute || all || snapshot
+
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"testing"
+
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+)
+
+func TestAccSnapshotBasic(t *testing.T) {
+	var snapshot ionoscloud.Snapshot
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		ExternalProviders:        randomProviderVersion343(),
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactoriesInternal(t, &testAccProvider),
+		CheckDestroy:             testAccCheckSnapshotDestroyCheck,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccCheckSnapshotConfigUpdateOnlyAttrs,
+				ExpectError: regexp.MustCompile(`can only be updated`),
+			},
+			{
+				Config: testAccCheckSnapshotConfigBasic,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSnapshotExists(constant.SnapshotResource+"."+constant.SnapshotTestResource, &snapshot),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "name", constant.SnapshotTestResource),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "description", constant.SnapshotTestResource),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "sec_auth_protection", "true"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "licence_type", "LINUX"),
+					// Test if set only because on creation the value is propagated from the image.
+					// `require_legacy_bios` is set to false in the configuration to ensure that it coincides with the value propagated from
+					// the image, and the `terraform plan` after the creation does not show any changes related to this property.
+					resource.TestCheckResourceAttrSet(constant.SnapshotResource+"."+constant.SnapshotTestResource, "require_legacy_bios"),
+				),
+			},
+			{
+				Config: testAccDataSourceSnapshotMatchID,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "name", constant.SnapshotResource+"."+constant.SnapshotTestResource, "name"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "location", constant.SnapshotResource+"."+constant.SnapshotTestResource, "location"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "size", constant.SnapshotResource+"."+constant.SnapshotTestResource, "size"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "description", constant.SnapshotResource+"."+constant.SnapshotTestResource, "description"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "licence_type", constant.SnapshotResource+"."+constant.SnapshotTestResource, "licence_type"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "sec_auth_protection", constant.SnapshotResource+"."+constant.SnapshotTestResource, "sec_auth_protection"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "cpu_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "cpu_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "cpu_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "cpu_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "ram_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "ram_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "ram_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "ram_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "nic_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "nic_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "nic_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "nic_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "disc_virtio_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "disc_virtio_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "disc_scsi_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_scsi_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "disc_scsi_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_scsi_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceById, "require_legacy_bios", constant.SnapshotResource+"."+constant.SnapshotTestResource, "require_legacy_bios"),
+				),
+			},
+			{
+				Config: testAccDataSourceSnapshotMatching,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "name", constant.SnapshotResource+"."+constant.SnapshotTestResource, "name"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "location", constant.SnapshotResource+"."+constant.SnapshotTestResource, "location"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "size", constant.SnapshotResource+"."+constant.SnapshotTestResource, "size"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "description", constant.SnapshotResource+"."+constant.SnapshotTestResource, "description"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "licence_type", constant.SnapshotResource+"."+constant.SnapshotTestResource, "licence_type"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "sec_auth_protection", constant.SnapshotResource+"."+constant.SnapshotTestResource, "sec_auth_protection"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "cpu_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "cpu_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "cpu_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "cpu_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "ram_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "ram_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "ram_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "ram_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "nic_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "nic_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "nic_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "nic_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "disc_virtio_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "disc_virtio_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "disc_scsi_hot_plug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_scsi_hot_plug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "disc_scsi_hot_unplug", constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_scsi_hot_unplug"),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.SnapshotResource+"."+constant.SnapshotDataSourceByName, "require_legacy_bios", constant.SnapshotResource+"."+constant.SnapshotTestResource, "require_legacy_bios"),
+				),
+			},
+			{
+				Config:      testAccDataSourceSnapshotWrongNameError,
+				ExpectError: regexp.MustCompile(`no snapshot found with the specified criteria`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotWrongLocation,
+				ExpectError: regexp.MustCompile(`no snapshot found with the specified criteria`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotWrongSize,
+				ExpectError: regexp.MustCompile(`no snapshot found with the specified criteria`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotBothIdAndNameError,
+				ExpectError: regexp.MustCompile(`id and name cannot be both specified in the same time`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotNoIdNoNameError,
+				ExpectError: regexp.MustCompile(`please provide either the snapshot id or name`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotWrongIdError,
+				ExpectError: regexp.MustCompile(`an error occurred while fetching the snapshot with ID`),
+			},
+			{
+				Config:      testAccDataSourceSnapshotMultipleResultsError,
+				ExpectError: regexp.MustCompile(`more than one snapshot found with the specified criteria`),
+			},
+			{
+				Config: testAccCheckSnapshotConfigUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "name", constant.UpdatedResources),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "description", constant.UpdatedResources),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "sec_auth_protection", "false"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "cpu_hot_plug", "false"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "nic_hot_plug", "false"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "ram_hot_plug", "false"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_unplug", "false"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "disc_virtio_hot_plug", "true"),
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "licence_type", "OTHER"),
+					// Test if set AND the value because on update the value can be changed, unlike the creation for which
+					// the value does not matter because the final value will be propagated from the image.
+					resource.TestCheckResourceAttr(constant.SnapshotResource+"."+constant.SnapshotTestResource, "require_legacy_bios", "true"),
+				),
+			},
+		},
+	})
+}
+
+func testAccCheckSnapshotDestroyCheck(s *terraform.State) error {
+	ctx, cancel := context.WithTimeout(context.Background(), *resourceDefaultTimeouts.Delete)
+	if cancel != nil {
+		defer cancel()
+	}
+
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != constant.SnapshotResource {
+			continue
+		}
+
+		client, err := testAccProvider.Meta().(bundleclient.SdkBundle).NewCloudAPIClient(ctx, rs.Primary.Attributes["location"])
+		if err != nil {
+			return err
+		}
+
+		_, apiResponse, err := client.SnapshotsApi.SnapshotsFindById(ctx, rs.Primary.ID).Execute()
+		logApiRequestTime(apiResponse)
+
+		if err != nil {
+			if !httpNotFound(apiResponse) {
+				return fmt.Errorf("unable to fetch snapshot %s %s", rs.Primary.ID, err)
+			}
+		} else {
+			return fmt.Errorf("snapshot %s still exists", rs.Primary.ID)
+		}
+	}
+
+	return nil
+}
+
+func testAccCheckSnapshotExists(n string, snapshot *ionoscloud.Snapshot) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[n]
+
+		if !ok {
+			return fmt.Errorf("testAccCheckSnapshotExists: Not found: %s", n)
+		}
+
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("no Record ID is set")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), *resourceDefaultTimeouts.Default)
+		if cancel != nil {
+			defer cancel()
+		}
+
+		client, err := testAccProvider.Meta().(bundleclient.SdkBundle).NewCloudAPIClient(ctx, rs.Primary.Attributes["location"])
+		if err != nil {
+			return err
+		}
+
+		foundServer, apiResponse, err := client.SnapshotsApi.SnapshotsFindById(ctx, rs.Primary.ID).Execute()
+		logApiRequestTime(apiResponse)
+
+		if err != nil {
+			return fmt.Errorf("error occurred while fetching Snapshot: %s", rs.Primary.ID)
+		}
+		if *foundServer.Id != rs.Primary.ID {
+			return fmt.Errorf("record not found")
+		}
+
+		snapshot = &foundServer
+
+		return nil
+	}
+}
+
+const testAccCheckSnapshotConfigBasic = testSnapshotServer + `
+resource ` + constant.SnapshotResource + ` ` + constant.SnapshotTestResource + ` {
+  datacenter_id = ` + constant.DatacenterResource + `.` + constant.DatacenterTestResource + `.id
+  volume_id = ` + constant.ServerResource + `.` + constant.ServerTestResource + `.boot_volume
+  name = "` + constant.SnapshotTestResource + `"
+  description = "` + constant.SnapshotTestResource + `"
+  sec_auth_protection = true
+  licence_type = "LINUX"
+  require_legacy_bios = false
+}
+`
+
+const testAccCheckSnapshotConfigUpdate = testSnapshotServer + `
+resource ` + constant.SnapshotResource + ` ` + constant.SnapshotTestResource + ` {
+  datacenter_id = ` + constant.DatacenterResource + `.` + constant.DatacenterTestResource + `.id
+  volume_id = ` + constant.ServerResource + `.` + constant.ServerTestResource + `.boot_volume
+  name = "` + constant.UpdatedResources + `"
+  description = "` + constant.UpdatedResources + `"
+  sec_auth_protection = false
+  cpu_hot_plug = false
+  nic_hot_plug = false
+  disc_virtio_hot_plug = true
+  disc_virtio_hot_unplug = false
+  ram_hot_plug = false
+  licence_type = "OTHER"
+  require_legacy_bios = true
+}`
+
+const testAccDataSourceSnapshotMatchID = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceById + ` {
+  id = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.id
+}`
+
+const testAccDataSourceSnapshotMatching = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    name = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.name
+    location = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.location
+    size = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.size
+}`
+
+const testAccDataSourceSnapshotWrongNameError = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    name = "wrong_name"
+    location = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.location
+    size = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.size
+}`
+
+const testAccDataSourceSnapshotWrongLocation = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    name = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.name
+    location = "wrong_location"
+    size = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.size
+}`
+
+const testAccDataSourceSnapshotWrongSize = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    name = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.name
+    location = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.location
+    size = 1234
+}`
+
+const testAccDataSourceSnapshotBothIdAndNameError = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    id   = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.id
+    name = ` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `.name
+}`
+
+const testAccDataSourceSnapshotNoIdNoNameError = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+}`
+
+const testAccDataSourceSnapshotWrongIdError = testAccCheckSnapshotConfigBasic + `
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceById + ` {
+    id = "00000000-0000-0000-0000-000000000000"
+}`
+
+const testAccDataSourceSnapshotMultipleResultsError = testAccCheckSnapshotConfigBasic + `
+resource ` + constant.SnapshotResource + ` ` + constant.SnapshotTestResource + `_same_name {
+  datacenter_id = ` + constant.DatacenterResource + `.` + constant.DatacenterTestResource + `.id
+  volume_id     = ` + constant.ServerResource + `.` + constant.ServerTestResource + `.boot_volume
+  name          = "` + constant.SnapshotTestResource + `"
+  description   = "` + constant.SnapshotTestResource + `_dup"
+  licence_type  = "LINUX"
+}
+
+data ` + constant.SnapshotResource + ` ` + constant.SnapshotDataSourceByName + ` {
+    name       = "` + constant.SnapshotTestResource + `"
+    depends_on = [` + constant.SnapshotResource + `.` + constant.SnapshotTestResource + `_same_name]
+}`
+
+const testAccCheckSnapshotConfigUpdateOnlyAttrs = testSnapshotServer + `
+resource ` + constant.SnapshotResource + ` ` + constant.SnapshotTestResource + ` {
+  datacenter_id = ` + constant.DatacenterResource + `.` + constant.DatacenterTestResource + `.id
+  volume_id = ` + constant.ServerResource + `.` + constant.ServerTestResource + `.boot_volume
+  name = "` + constant.SnapshotTestResource + `"
+  cpu_hot_plug = true
+}`

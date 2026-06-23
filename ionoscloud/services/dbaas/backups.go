@@ -1,0 +1,96 @@
+package dbaas
+
+import (
+	"context"
+	"fmt"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/google/uuid"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/ionos-cloud/sdk-go-bundle/products/dbaas/psql/v2"
+)
+
+func (c *PsqlClient) GetClusterBackups(ctx context.Context, clusterID string) (psql.ClusterBackupList, *shared.APIResponse, error) {
+	backups, apiResponse, err := c.sdkClient.BackupsApi.ClusterBackupsGet(ctx, clusterID).Execute()
+	apiResponse.LogInfo()
+	return backups, apiResponse, err
+
+}
+
+func (c *PsqlClient) GetAllBackups(ctx context.Context) (psql.ClusterBackupList, *shared.APIResponse, error) {
+	backups, apiResponse, err := c.sdkClient.BackupsApi.ClustersBackupsGet(ctx).Execute()
+	apiResponse.LogInfo()
+	return backups, apiResponse, err
+}
+
+func SetPgSqlClusterBackupData(d *schema.ResourceData, clusterBackups *psql.ClusterBackupList) diag.Diagnostics {
+
+	resourceID := uuid.New()
+	d.SetId(resourceID.String())
+
+	if clusterBackups.Items != nil {
+		var backups []any
+		for _, backup := range clusterBackups.Items {
+
+			backupEntry := make(map[string]any)
+			if backup.Id != nil {
+				backupEntry["id"] = *backup.Id
+			}
+
+			if backup.Properties == nil {
+				return diag.FromErr(fmt.Errorf("backup properties do not exist."))
+			}
+
+			if backup.Properties.ClusterId != nil {
+				backupEntry["cluster_id"] = *backup.Properties.ClusterId
+			}
+
+			if backup.Properties.Size != nil {
+				backupEntry["size"] = *backup.Properties.Size
+			}
+
+			if backup.Properties.Location != nil {
+				backupEntry["location"] = *backup.Properties.Location
+			}
+
+			if backup.Properties.Version != nil {
+				backupEntry["version"] = *backup.Properties.Version
+			}
+
+			if backup.Properties.IsActive != nil {
+				backupEntry["is_active"] = *backup.Properties.IsActive
+			}
+
+			if backup.Properties.EarliestRecoveryTargetTime != nil {
+				backupEntry["earliest_recovery_target_time"] = (*backup.Properties.EarliestRecoveryTargetTime).String()
+			}
+
+			if backup.Type != nil {
+				backupEntry["type"] = *backup.Type
+			}
+
+			if backup.Metadata != nil {
+				var metadata []any
+
+				metadataEntry := make(map[string]any)
+
+				if backup.Metadata.CreatedDate != nil {
+					metadataEntry["created_date"] = (*backup.Metadata.CreatedDate).Time.Format("2006-01-02T15:04:05Z")
+				}
+
+				metadata = append(metadata, metadataEntry)
+				backupEntry["metadata"] = metadata
+			}
+
+			backups = append(backups, backupEntry)
+
+		}
+		err := d.Set("cluster_backups", backups)
+		if err != nil {
+			diags := diag.FromErr(fmt.Errorf("error while setting cluster_backups: %w", err))
+			return diags
+		}
+	}
+	return nil
+}

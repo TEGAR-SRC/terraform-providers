@@ -1,0 +1,217 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/ionos-cloud/sdk-go-bundle/products/cdn/v2"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	cdnservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cdn"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceCDNDistribution() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceCDNDistributionRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"resource_urn": {
+				Type:        schema.TypeString,
+				Description: "Unique name of the resource.",
+				Computed:    true,
+			},
+			"public_endpoint_v4": {
+				Type:        schema.TypeString,
+				Description: "IP of the distribution, it has to be included on the domain DNS Zone as A record.",
+				Computed:    true,
+			},
+			"public_endpoint_v6": {
+				Type:        schema.TypeString,
+				Description: "IP of the distribution, it has to be included on the domain DNS Zone as AAAA record.",
+				Computed:    true,
+			},
+			"partial_match": {
+				Type:        schema.TypeBool,
+				Description: "Whether partial matching is allowed or not when using domain argument.",
+				Default:     false,
+				Optional:    true,
+			},
+			"domain": {
+				Type:        schema.TypeString,
+				Description: "The domain of the distribution.",
+				Optional:    true,
+			},
+			"certificate_id": {
+				Type:        schema.TypeString,
+				Description: "The ID of the certificate to use for the distribution.",
+				Computed:    true,
+			},
+			"routing_rules": {
+				Type:        schema.TypeList,
+				Description: "The routing rules for the distribution.",
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"scheme": {
+							Type:        schema.TypeString,
+							Description: "The scheme of the routing rule.",
+							Computed:    true,
+						},
+						"prefix": {
+							Type:        schema.TypeString,
+							Description: "The prefix of the routing rule.",
+							Computed:    true,
+						},
+						"upstream": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"host": {
+										Type:        schema.TypeString,
+										Description: "The upstream host that handles the requests if not already cached. This host will be protected by the WAF if the option is enabled.",
+										Computed:    true,
+									},
+									"caching": {
+										Type:        schema.TypeBool,
+										Description: "Enable or disable caching. If enabled, the CDN will cache the responses from the upstream host. Subsequent requests for the same resource will be served from the cache.",
+										Computed:    true,
+									},
+									"waf": {
+										Type:        schema.TypeBool,
+										Description: "Enable or disable WAF to protect the upstream host.",
+										Computed:    true,
+									},
+									"sni_mode": {
+										Type:        schema.TypeString,
+										Description: "The SNI (Server Name Indication) mode of the upstream host. It supports two modes: 'distribution' and 'origin', for more information about these modes please check the data source docs.",
+										Computed:    true,
+									},
+									"geo_restrictions": {
+										Type:     schema.TypeList,
+										Computed: true,
+										Elem: &schema.Resource{
+											Schema: map[string]*schema.Schema{
+												"block_list": {
+													Type: schema.TypeSet,
+													Elem: &schema.Schema{
+														Type: schema.TypeString,
+													},
+													Computed: true,
+												},
+												"allow_list": {
+													Type: schema.TypeSet,
+													Elem: &schema.Schema{
+														Type: schema.TypeString,
+													},
+													Computed: true,
+												},
+											},
+										},
+									},
+									"rate_limit_class": {
+										Type:        schema.TypeString,
+										Description: "Rate limit class that will be applied to limit the number of incoming requests per IP.",
+										Computed:    true,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceCDNDistributionRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CDNClient
+
+	idValue, idOk := d.GetOk("id")
+	domainValue, domainOk := d.GetOk("domain")
+
+	id := idValue.(string)
+	domain := domainValue.(string)
+
+	if idOk && domainOk {
+		return diagutil.ToDiags(d, fmt.Errorf("id and domain cannot be both specified in the same time"), nil)
+	}
+	if !idOk && !domainOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide the distribution id or domain"), nil)
+	}
+
+	var distribution cdn.Distribution
+	var apiResponse *shared.APIResponse
+	var err error
+
+	if idOk {
+		/* search by ID */
+		distribution, apiResponse, err = client.SdkClient.DistributionsApi.DistributionsFindById(ctx, id).Execute()
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching the distribution with ID %s: %w", id, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+	} else {
+		var results []cdn.Distribution
+
+		distributions, apiResponse, err := client.SdkClient.DistributionsApi.DistributionsGet(ctx).Execute()
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching container distributions: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+
+		results = distributions.Items
+		if domainOk {
+			partialMatch := d.Get("partial_match").(bool)
+
+			tflog.Info(ctx, "searching CDN distributions by domain", map[string]any{"partial_match": partialMatch, "domain": domain})
+
+			if len(distributions.Items) > 0 {
+				var distributionsByDomain []cdn.Distribution
+
+				for _, distributionItem := range distributions.Items {
+					if isValidDomain(distributionItem.Properties, domain, partialMatch) {
+						distributionsByDomain = append(distributionsByDomain, distributionItem)
+					}
+				}
+				if len(distributionsByDomain) > 0 {
+					results = distributionsByDomain
+				} else {
+					return diagutil.ToDiags(d, fmt.Errorf("no distribution found with the specified criteria: domain = %v", domain), nil)
+				}
+			}
+		}
+
+		switch {
+		case len(results) == 0:
+			return diagutil.ToDiags(d, fmt.Errorf("no CDN distribution found with the specified criteria: domain = %s", domain), nil)
+		case len(results) > 1:
+			return diagutil.ToDiags(d, fmt.Errorf("more than one CDN distribution found with the specified criteria: domain = %s", domain), nil)
+		default:
+			distribution = results[0]
+		}
+	}
+
+	if err := cdnservice.SetDistributionData(d, distribution); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+
+}
+
+func isValidDomain(properties cdn.DistributionProperties, domain string, partialMatch bool) bool {
+	if partialMatch {
+		return strings.Contains(properties.Domain, domain)
+	}
+	return strings.EqualFold(properties.Domain, domain)
+}

@@ -1,0 +1,122 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package cdrom
+
+import (
+	"context"
+
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/vms"
+	"github.com/bpg/terraform-provider-proxmox/utils"
+)
+
+// Value represents the type for CD-ROM settings.
+type Value = types.Map
+
+// NewValue returns a new Value with the given CD-ROM settings from the PVE API.
+//
+// Returns NullValue() when the VM has no CD-ROM devices attached — PVE does not auto-attach
+// CD-ROMs, so "no devices" at the API is the user's "no cdrom block" in HCL. Returning a
+// non-null empty Map would produce a permanent plan-vs-state diff now that the map-level
+// schema is Optional only (per ADR-004 §Provider Defaults vs PVE Defaults).
+func NewValue(ctx context.Context, config *vms.GetResponseData, diags *diag.Diagnostics) Value {
+	// find storage devices with media=cdrom
+	cdroms := config.StorageDevices.Filter(func(device *vms.CustomStorageDevice) bool {
+		return device.Media != nil && *device.Media == "cdrom"
+	})
+
+	if len(cdroms) == 0 {
+		return NullValue()
+	}
+
+	elements := make(map[string]Model, len(cdroms))
+
+	for iface, cdrom := range cdroms {
+		m := Model{}
+		m.fromAPI(*cdrom)
+		elements[iface] = m
+	}
+
+	obj, d := types.MapValueFrom(ctx, types.ObjectType{}.WithAttributeTypes(attributeTypes()), elements)
+	diags.Append(d...)
+
+	return obj
+}
+
+// FillCreateBody fills the CreateRequestBody with the CD-ROM settings from the Value.
+//
+// In the 'create' context, v is the plan.
+func FillCreateBody(ctx context.Context, planValue Value, body *vms.CreateRequestBody, diags *diag.Diagnostics) {
+	if planValue.IsNull() || planValue.IsUnknown() {
+		return
+	}
+
+	var plan map[string]Model
+
+	d := planValue.ElementsAs(ctx, &plan, false)
+	diags.Append(d...)
+
+	if d.HasError() {
+		return
+	}
+
+	for iface, cdrom := range plan {
+		body.AddCustomStorageDevice(iface, cdrom.toAPI())
+	}
+}
+
+// FillUpdateBody fills the UpdateRequestBody with the CD-ROM settings from the Value.
+//
+// In the 'update' context, planValue is the plan and stateValue is the current state. Either
+// side may be null (e.g. plan is null when the user removes the whole `cdrom` block; state is
+// null on a refresh of a VM that never had a CD-ROM). Null is treated as an empty map so
+// MapDiff can still produce slot-level creates/deletes — a null plan with non-null state must
+// emit `delete=<slot>` for every existing slot, otherwise PVE keeps the devices and Terraform
+// sees permanent drift.
+func FillUpdateBody(
+	ctx context.Context,
+	planValue, stateValue Value,
+	updateBody *vms.UpdateRequestBody,
+	diags *diag.Diagnostics,
+) {
+	if planValue.IsUnknown() || planValue.Equal(stateValue) {
+		return
+	}
+
+	var plan, state map[string]Model
+
+	if !planValue.IsNull() {
+		d := planValue.ElementsAs(ctx, &plan, false)
+		diags.Append(d...)
+	}
+
+	if !stateValue.IsNull() {
+		d := stateValue.ElementsAs(ctx, &state, false)
+		diags.Append(d...)
+	}
+
+	if diags.HasError() {
+		return
+	}
+
+	toCreate, toUpdate, toDelete := utils.MapDiff(plan, state)
+
+	for iface, dev := range toCreate {
+		updateBody.AddCustomStorageDevice(iface, dev.toAPI())
+	}
+
+	for iface, dev := range toUpdate {
+		// for CD-ROMs, the update fully override the existing device, we don't do per-attribute check
+		updateBody.AddCustomStorageDevice(iface, dev.toAPI())
+	}
+
+	for iface := range toDelete {
+		updateBody.Delete = append(updateBody.Delete, iface)
+	}
+}

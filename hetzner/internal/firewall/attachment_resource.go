@@ -1,0 +1,360 @@
+package firewall
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"slices"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/util"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/util/hcloudutil"
+)
+
+var errorNoResourcesReferenced = errors.New("no resources referenced")
+
+// AttachmentResourceType is the type of the hcloud_firewall_attachment resource.
+const AttachmentResourceType = "hcloud_firewall_attachment"
+
+// AttachmentResource defines the schema for the hcloud_firewall_attachment
+// resource.
+func AttachmentResource() *schema.Resource {
+	return &schema.Resource{
+		ReadContext:   readAttachment,
+		CreateContext: createAttachment,
+		UpdateContext: updateAttachment,
+		DeleteContext: deleteAttachment,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceFirewallAttachmentImport,
+		},
+
+		Schema: map[string]*schema.Schema{
+			"firewall_id": {
+				Type:     schema.TypeInt,
+				Required: true,
+				ForceNew: true,
+			},
+			"server_ids": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeInt,
+				},
+			},
+			"label_selectors": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+		},
+	}
+}
+
+func readAttachment(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	var att attachment
+
+	if err := att.FromResourceData(d); err != nil {
+		// This happens during an import of the resource,
+		// but we really only care about the FirewallID anyway
+		if !errors.Is(err, errorNoResourcesReferenced) {
+			return diag.FromErr(err)
+		}
+	}
+
+	client := m.(*hcloud.Client)
+	fw, _, err := client.Firewall.GetByID(ctx, att.FirewallID)
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	if fw == nil {
+		log.Printf("[WARN] firewall (%s) not found, removing from state", d.Id())
+		d.SetId("")
+		return nil
+	}
+
+	if err := att.FromFirewall(fw); err != nil {
+		return diag.FromErr(err)
+	}
+	att.ToResourceData(d)
+
+	return nil
+}
+
+func createAttachment(ctx context.Context, d *schema.ResourceData, m any) (diags diag.Diagnostics) {
+	var att attachment
+
+	if err := att.FromResourceData(d); err != nil {
+		return diag.FromErr(err)
+	}
+
+	client := m.(*hcloud.Client)
+	actions, _, err := client.Firewall.ApplyResources(ctx, &hcloud.Firewall{ID: att.FirewallID}, att.AllResources())
+	if hcloud.IsError(err, hcloud.ErrorCodeFirewallAlreadyApplied) {
+		return readAttachment(ctx, d, m)
+	}
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	if err = client.Action.WaitFor(ctx, actions...); err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+
+	return readAttachment(ctx, d, m)
+}
+
+func updateAttachment(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
+	var (
+		tf, hc  attachment
+		actions []*hcloud.Action
+	)
+
+	if err := tf.FromResourceData(d); err != nil {
+		return diag.FromErr(err)
+	}
+
+	client := m.(*hcloud.Client)
+	fw, _, err := client.Firewall.GetByID(ctx, tf.FirewallID)
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	if fw == nil {
+		log.Printf("[WARN] firewall (%s) not found, removing from state", d.Id())
+		d.SetId("")
+		return nil
+	}
+	if err := hc.FromFirewall(fw); err != nil {
+		return diag.FromErr(err)
+	}
+
+	less, more := tf.DiffResources(hc)
+	as, _, err := client.Firewall.RemoveResources(ctx, fw, less)
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	actions = append(actions, as...)
+
+	as, _, err = client.Firewall.ApplyResources(ctx, fw, more)
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	actions = append(actions, as...)
+
+	if err = client.Action.WaitFor(ctx, actions...); err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+
+	return readAttachment(ctx, d, m)
+}
+
+func deleteAttachment(ctx context.Context, d *schema.ResourceData, m any) (diags diag.Diagnostics) {
+	var att attachment
+
+	defer func() {
+		if diags != nil {
+			return
+		}
+		d.SetId("")
+	}()
+
+	if err := att.FromResourceData(d); err != nil {
+		return diag.FromErr(err)
+	}
+	client := m.(*hcloud.Client)
+	actions, _, err := client.Firewall.RemoveResources(ctx, &hcloud.Firewall{ID: att.FirewallID}, att.AllResources())
+	if err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	if err = client.Action.WaitFor(ctx, actions...); err != nil {
+		return hcloudutil.ErrorToDiag(err)
+	}
+	return nil
+}
+
+type attachment struct {
+	FirewallID     int64
+	ServerIDs      []int64
+	LabelSelectors []string
+}
+
+// FromResourceData copies the contents of d into a
+func (a *attachment) FromResourceData(d *schema.ResourceData) error {
+	// The terraform schema definition above ensures this is always set and
+	// of the correct type. Thus, there is no need to check such things.
+	a.FirewallID = util.CastInt64(d.Get("firewall_id"))
+
+	srvIDs, ok := d.GetOk("server_ids")
+	if ok {
+		for _, v := range srvIDs.(*schema.Set).List() {
+			a.ServerIDs = append(a.ServerIDs, util.CastInt64(v))
+		}
+		slices.Sort(a.ServerIDs)
+	}
+
+	lSels, ok := d.GetOk("label_selectors")
+	if ok {
+		for _, v := range lSels.(*schema.Set).List() {
+			a.LabelSelectors = append(a.LabelSelectors, v.(string))
+		}
+		slices.Sort(a.LabelSelectors)
+	}
+
+	if len(a.ServerIDs) == 0 && len(a.LabelSelectors) == 0 {
+		return errorNoResourcesReferenced
+	}
+	return nil
+}
+
+// ToResourceData copies the contents of a into d.
+//
+// Any previously existing values in d are overwritten or removed.
+func (a *attachment) ToResourceData(d *schema.ResourceData) {
+	var srvIDs, lSels *schema.Set
+
+	if len(a.ServerIDs) > 0 {
+		vals := make([]any, len(a.ServerIDs))
+		for i, id := range a.ServerIDs {
+			vals[i] = util.CastInt(id)
+		}
+		f := d.Get("server_ids").(*schema.Set).F // Returns a default value if server_ids is not present in HCL.
+		srvIDs = schema.NewSet(f, vals)
+	}
+	d.Set("server_ids", srvIDs)
+
+	if len(a.LabelSelectors) > 0 {
+		vals := make([]any, len(a.LabelSelectors))
+		for i, ls := range a.LabelSelectors {
+			vals[i] = ls
+		}
+		f := d.Get("label_selectors").(*schema.Set).F
+		lSels = schema.NewSet(f, vals)
+	}
+	d.Set("label_selectors", lSels)
+
+	d.Set("firewall_id", util.CastInt(a.FirewallID))
+	d.SetId(util.FormatID(a.FirewallID))
+}
+
+// FromFirewall reads the attachment data from fw into a.
+func (a *attachment) FromFirewall(fw *hcloud.Firewall) error {
+	// We do not need to read the fw.ID. This value is always set in HCL.
+	// Additionally the intended use-case makes sure that we never get data
+	// for the wrong firewall. Therefore comparing fw.ID to a.FirewallID
+	// is not necessary.
+
+	for _, fwr := range fw.AppliedTo {
+		switch fwr.Type {
+		case hcloud.FirewallResourceTypeServer:
+			a.ServerIDs = append(a.ServerIDs, fwr.Server.ID)
+		case hcloud.FirewallResourceTypeLabelSelector:
+			a.LabelSelectors = append(a.LabelSelectors, fwr.LabelSelector.Selector)
+		default:
+			return fmt.Errorf("invalid firewall resource type: %v", fwr.Type)
+		}
+	}
+
+	return nil
+}
+
+// AllResources returns all Hetzner Cloud Firewall that are attached to
+// the Firewall of this attachment.
+func (a *attachment) AllResources() []hcloud.FirewallResource {
+	n := len(a.ServerIDs) + len(a.LabelSelectors)
+	if n == 0 {
+		return nil
+	}
+
+	ress := make([]hcloud.FirewallResource, 0, n)
+	for _, id := range a.ServerIDs {
+		ress = append(ress, serverResource(id))
+	}
+	for _, ls := range a.LabelSelectors {
+		ress = append(ress, labelSelectorResource(ls))
+	}
+
+	return ress
+}
+
+// DiffResources compares the Firewall resources of a to the resources of o.
+//
+// The first return value contains all resources that are present in o but
+// missing in a. The second return value is a slice containing all resources
+// present in a but missing in o.
+func (a *attachment) DiffResources(o attachment) ([]hcloud.FirewallResource, []hcloud.FirewallResource) {
+	var more, less []hcloud.FirewallResource // nolint: prealloc
+
+	aSrvs := make(map[int64]bool, len(a.ServerIDs))
+	for _, id := range a.ServerIDs {
+		aSrvs[id] = true
+	}
+	for _, id := range o.ServerIDs {
+		if aSrvs[id] {
+			continue
+		}
+		less = append(less, serverResource(id))
+	}
+
+	aLSels := make(map[string]bool, len(a.LabelSelectors))
+	for _, ls := range a.LabelSelectors {
+		aLSels[ls] = true
+	}
+	for _, ls := range o.LabelSelectors {
+		if aLSels[ls] {
+			continue
+		}
+		less = append(less, labelSelectorResource(ls))
+	}
+
+	oSrvs := make(map[int64]bool, len(o.ServerIDs))
+	for _, id := range o.ServerIDs {
+		oSrvs[id] = true
+	}
+	for _, id := range a.ServerIDs {
+		if oSrvs[id] {
+			continue
+		}
+		more = append(more, serverResource(id))
+	}
+
+	oLSels := make(map[string]bool, len(o.LabelSelectors))
+	for _, ls := range o.LabelSelectors {
+		oLSels[ls] = true
+	}
+	for _, ls := range a.LabelSelectors {
+		if oLSels[ls] {
+			continue
+		}
+		more = append(more, labelSelectorResource(ls))
+	}
+
+	return less, more
+}
+
+func serverResource(id int64) hcloud.FirewallResource {
+	return hcloud.FirewallResource{
+		Type:   hcloud.FirewallResourceTypeServer,
+		Server: &hcloud.FirewallResourceServer{ID: id},
+	}
+}
+
+func labelSelectorResource(ls string) hcloud.FirewallResource {
+	return hcloud.FirewallResource{
+		Type:          hcloud.FirewallResourceTypeLabelSelector,
+		LabelSelector: &hcloud.FirewallResourceLabelSelector{Selector: ls},
+	}
+}
+
+func resourceFirewallAttachmentImport(_ context.Context, d *schema.ResourceData, _ any) ([]*schema.ResourceData, error) {
+	firewallID, err := util.ParseID(d.Id())
+	if err != nil {
+		return nil, err
+	}
+	d.Set("firewall_id", util.CastInt(firewallID))
+
+	return []*schema.ResourceData{d}, nil
+}

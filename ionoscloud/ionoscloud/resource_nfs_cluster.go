@@ -1,0 +1,208 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go-bundle/products/nfs/v2"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/nfs"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func resourceNFSCluster() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceNFSClusterCreate,
+		ReadContext:   resourceNFSClusterRead,
+		UpdateContext: resourceNFSClusterUpdate,
+		DeleteContext: resourceNFSClusterDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceNFSClusterImport,
+		},
+		Schema: map[string]*schema.Schema{
+			"location": {
+				Type: schema.TypeString,
+				Description: fmt.Sprintf(
+					"The location of the Network File Storage Cluster. "+
+						"Available locations: '%s'", strings.Join(nfs.ValidNFSLocations, ", '"),
+				),
+				Optional: true,
+				ForceNew: true,
+			},
+			"id": {
+				Type:        schema.TypeString,
+				Description: "The ID of the Network File Storage Cluster.",
+				Computed:    true,
+			},
+			"name": {
+				Type:        schema.TypeString,
+				Description: "The name of the Network File Storage Cluster.",
+				Required:    true,
+			},
+			"connections": {
+				Type:        schema.TypeList,
+				Description: "The network connections for the Network File Storage Cluster.",
+				Required:    true,
+				MaxItems:    1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"datacenter_id": {
+							Type:        schema.TypeString,
+							Description: "The datacenter to connect your instance to.",
+							Required:    true,
+						},
+						"lan": {
+							Type:        schema.TypeString,
+							Description: "The numeric LAN ID to connect your instance to.",
+							Required:    true,
+						},
+						"ip_address": {
+							Type:        schema.TypeString,
+							Description: "The IP address and subnet for your instance.",
+							Required:    true,
+						},
+					},
+				},
+			},
+			"nfs": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"min_version": {
+							Description: "The minimum Network File Storage version",
+							Type:        schema.TypeString,
+							Optional:    true,
+						},
+					},
+				},
+			},
+			"size": {
+				Type:        schema.TypeInt,
+				Description: "The size of the Network File Storage Cluster. Minimum size is 2.",
+				Required:    true,
+			},
+			"size_unit": {
+				Type:         schema.TypeString,
+				Description:  "The unit of the 'size' attribute. Can be 'TiB' or 'GiB'. Defaults to 'TiB'.",
+				Optional:     true,
+				Computed:     true,
+				ValidateFunc: validation.StringInSlice([]string{"TiB", "GiB"}, false),
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func resourceNFSClusterCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).NFSClient
+
+	response, apiResponse, err := client.CreateNFSCluster(ctx, d)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error creating NFS Cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	clusterID := response.Id
+	d.SetId(clusterID)
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsClusterReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error checking status for NFS Cluster with ID %v: %w", clusterID, err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String()})
+	}
+	if err := client.SetNFSClusterData(d, response); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	return nil
+}
+
+func resourceNFSClusterUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).NFSClient
+
+	response, apiResponse, err := client.UpdateNFSCluster(ctx, d)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error updating NFS Cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsClusterReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error checking status for NFS Cluster %w", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String()})
+	}
+	if err := client.SetNFSClusterData(d, response); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	return nil
+}
+
+func resourceNFSClusterDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).NFSClient
+	clusterID := d.Id()
+	apiResponse, err := client.DeleteNFSCluster(ctx, d)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error deleting NFS Cluster with ID: %v, error: %w", clusterID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	err = utils.WaitForResourceToBeDeleted(ctx, d, client.IsClusterDeleted)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("deletion check failed for NFS Cluster with ID: %v, error: %w", clusterID, err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String()})
+	}
+	return nil
+}
+
+func resourceNFSClusterImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	client := meta.(bundleclient.SdkBundle).NFSClient
+	parts := strings.Split(d.Id(), ":")
+	if len(parts) != 2 {
+		return nil, diagutil.ToError(d, fmt.Errorf("invalid import, expected ID in the format '<location>:<replica_set_id>'"), nil)
+	}
+	location := parts[0]
+	id := parts[1]
+
+	err := d.Set("location", location)
+	if err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("failed setting location %s: %w", location, err), nil)
+	}
+	err = d.Set("id", id)
+	if err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("failed setting id %s: %w", id, err), nil)
+	}
+
+	cluster, err := findCluster(ctx, d, id, location, client)
+	if err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("error finding NFS Cluster: %w", err), nil)
+	}
+	if err := client.SetNFSClusterData(d, cluster); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	return []*schema.ResourceData{d}, nil
+}
+
+func resourceNFSClusterRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).NFSClient
+	cluster, err := findCluster(ctx, d, d.Id(), d.Get("location").(string), client)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error finding NFS Cluster: %w", err), nil)
+	}
+	if errSetData := client.SetNFSClusterData(d, cluster); errSetData != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("failed to set NFS Cluster data: %w", errSetData), nil)
+	}
+	return nil
+}
+
+func findCluster(ctx context.Context, d *schema.ResourceData, id, location string, client *nfs.Client) (ionoscloud.ClusterRead, error) {
+	cluster, resp, err := client.GetNFSClusterByID(ctx, id, location)
+	if err != nil {
+		if resp.HttpNotFound() {
+			d.SetId("")
+			return ionoscloud.ClusterRead{},
+				fmt.Errorf("NFS Cluster %s does not exist in %s: %w", id, location, err)
+		}
+		return ionoscloud.ClusterRead{},
+			fmt.Errorf("couldn't find NFS Cluster %s in %s: %w", id, location, err)
+	}
+	tflog.Info(ctx, "NFS cluster found", map[string]any{"cluster_id": id, "location": location})
+	return cluster, nil
+}

@@ -1,0 +1,129 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - canonicalheader
+    - cyclop
+    - depguard
+    - err113
+    - exhaustruct
+    - forcetypeassert
+    - funlen
+    - funcorder # nice to have, but currently generating too many errors
+    - gocognit
+    - gocyclo
+    - gomodguard # deprecated since v2.12.0, replaced by gomodguard_v2 (auto-enabled by `default: all`)
+    - ireturn
+    - maintidx
+    - mnd
+    - nestif
+    - nlreturn
+    - noinlineerr
+    - perfsprint
+    - rowserrcheck
+    - tagliatelle
+    - testpackage
+    - tparallel
+    - varnamelen
+    - wastedassign
+    - wsl
+  settings:
+    cyclop:
+      max-complexity: 25
+    dupl:
+      threshold: 150
+    errcheck:
+      check-blank: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    funlen:
+      lines: 80
+      statements: 60
+    goconst:
+      min-len: 10
+      min-occurrences: 8
+    gosec:
+      excludes:
+        - G115
+        - G117
+        - G124
+        - G703
+        - G704
+    lll:
+      line-length: 150
+    revive:
+      rules:
+        - name: "package-comments"
+          disabled: true
+    wrapcheck:
+      ignore-package-globs:
+        - github.com/bpg/terraform-provider-proxmox/*
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+      disable:
+        - decl
+        - err
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - cyclop
+          - dupl
+          - funlen
+          - goconst
+          - gocognit
+          - gosec
+          - lll
+        path: _(test|gen)\.go
+      - linters:
+          - recvcheck
+        path: .*/types/.+\.go
+      - linters:
+          - lll
+          - recvcheck
+        path: _types\.go
+      - linters:
+          - paralleltest
+        path: fwprovider/.*_test\.go
+      - linters:
+          - lll
+        source: ^.*https?://.*$
+      - linters:
+          - prealloc
+        text: "diags"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new-from-rev: 9101977dc81f64db077b9a1eda2fe401359854c9
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+    - gci
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/bpg/terraform-provider-proxmox
+    gci:
+      custom-order: true
+      sections:
+        - Standard
+        - Default
+        - Prefix(github.com/bpg/terraform-provider-proxmox)

@@ -1,0 +1,123 @@
+---
+subcategory: "Object Storage"
+layout: "ionoscloud"
+page_title: "IONOS CLOUD: s3_bucket"
+sidebar_current: "docs-resource-s3_bucket"
+description: |-
+  Creates and manages IONOS Object Storage Buckets.
+---
+
+# ionoscloud_s3_bucket
+
+Manages [IONOS Object Storage Buckets](https://docs.ionos.com/cloud/storage-and-backup/ionos-object-storage) on IONOS CLOUD.
+
+
+
+## Example Usage
+
+```hcl
+
+resource "ionoscloud_s3_bucket" "example" {
+  name = "example"
+  region = "eu-central-3"
+  object_lock_enabled = true
+  force_destroy = true
+  
+  tags = {
+    key1 = "value1"
+    key2 = "value2"
+  }
+
+  timeouts {
+    create = "10m"
+    delete = "10m"
+  }
+}
+
+```
+
+## Argument Reference
+
+The following arguments are supported:
+
+- `name` - (Required)[string] The bucket name. [ 3 .. 63 ] characters
+- `region` - (Optional)[string] Specifies the Region where the bucket will be created. Available regions are: `eu-central-3`, `eu-central-4`, `us-central-1`. Can be used only if the region is the same as the global region (set using `IONOS_S3_REGION` env var or `s3_region` provider attribute) or if the global region is unset. For using multiple different regions, please check the `Working with multiple regions/locations` section presented [here](./../index.md).
+- `object_lock_enabled` - (Optional)[bool] The object lock configuration status of the bucket. Must be `true` or `false`.
+- `tags` - (Optional) A mapping of tags to assign to the bucket.
+- `timeouts` - (Optional) Timeouts for this resource.
+  - `create` - (Optional)[string] Time to wait for the bucket to be created. Default is `10m`.
+  - `delete` - (Optional)[string] Time to wait for the bucket to be deleted. Default is `60m`.
+- `force_destroy` - (Optional)[bool] Default is `false`.By setting force_destroy to true, you instruct Terraform to delete the bucket and all its contents during the terraform destroy process. This is particularly useful when dealing with buckets that contain objects, as it allows for automatic cleanup without requiring the manual deletion of objects beforehand. If force_destroy is not set or is set to false, Terraform will refuse to delete a bucket that still contains objects. You must manually empty the bucket before Terraform can remove it.There is a significant risk of accidental data loss when using this attribute, as it irreversibly deletes all contents of the bucket. It's crucial to ensure that the bucket does not contain critical data before using force_destroy.
+
+## Attributes Reference
+
+- `id` - (Computed) Name of the bucket
+
+⚠️ **Note:** The name must be unique across all IONOS accounts in all IONOS Object Storage regions. The name should adhere to the following [restrictions](https://docs.ionos.com/cloud/storage-and-backup/ionos-object-storage/concepts/buckets#naming-conventions).
+
+## Import
+
+In Terraform v1.12.0 and later, the [`import` block](https://developer.hashicorp.com/terraform/language/import) can be used with the `identity` attribute. For example:
+
+```hcl
+import {
+  to = ionoscloud_s3_bucket.example
+  identity = {
+    id     = "bucket_name"
+    region = "your_bucket_region"
+  }
+}
+
+resource "ionoscloud_s3_bucket" "example" {
+  ### Configuration omitted for brevity ###
+}
+```
+
+### Identity Schema
+
+#### Required
+
+* `id` (String) Name of the bucket.
+* `region` (String) Region where the bucket is located.
+
+---
+
+A bucket can be imported using the `bucket name` and the `region`:
+
+```shell
+terraform import ionoscloud_s3_bucket.example region:bucket_name
+```
+
+The `region` can be omitted, in which case the bucket will be imported from the default location: `eu-central-3`.
+
+```shell
+terraform import ionoscloud_s3_bucket.example bucket_name
+```
+
+## Query (List Resource)
+
+Object Storage buckets can be listed using `terraform query` (requires Terraform 1.14+). List blocks must be placed in a dedicated `tfquery.hcl` file.
+
+```hcl
+list "ionoscloud_s3_bucket" "all" {
+  provider         = ionoscloud
+  include_resource = true
+}
+```
+
+Filter by region:
+
+```hcl
+list "ionoscloud_s3_bucket" "eu_central" {
+  provider         = ionoscloud
+  include_resource = true
+  config {
+    filters = [{
+      field_name  = "region"
+      field_value = "eu-central-3"
+    }]
+  }
+}
+```
+
+See the [ionoscloud_s3_bucket list resource](../list-resources/s3_bucket.md) documentation for the full filter reference.

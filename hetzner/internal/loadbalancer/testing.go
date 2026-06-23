@@ -1,0 +1,210 @@
+package loadbalancer
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/teste2e"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/testsupport"
+	"github.com/hetznercloud/terraform-provider-hcloud/internal/testtemplate"
+)
+
+// GetAPIResource returns a [testsupport.GetAPIResourceFunc] for [hcloud.LoadBalancer].
+func GetAPIResource() testsupport.GetAPIResourceFunc[hcloud.LoadBalancer] {
+	return func(c *hcloud.Client, attrs map[string]string) (*hcloud.LoadBalancer, error) {
+		result, _, err := c.LoadBalancer.Get(context.Background(), attrs["id"])
+		return result, err
+	}
+}
+
+// ByID returns a function that obtains a loadbalancer by its ID.
+func ByID(t *testing.T, lb *hcloud.LoadBalancer) func(*hcloud.Client, int64) bool {
+	return func(c *hcloud.Client, id int64) bool {
+		found, _, err := c.LoadBalancer.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("find load balancer %d: %v", id, err)
+		}
+		if found == nil {
+			return false
+		}
+		if lb != nil {
+			*lb = *found
+		}
+		return true
+	}
+}
+
+// DData defines the fields for the "testdata/d/hcloud_load_balancer" template.
+type DData struct {
+	testtemplate.DataCommon
+
+	LoadBalancerID   string
+	LoadBalancerName string
+	LabelSelector    string
+}
+
+// TFID returns the data source identifier.
+func (d *DData) TFID() string {
+	return fmt.Sprintf("data.%s.%s", DataSourceType, d.RName())
+}
+
+// DDataList defines the fields for the "testdata/d/hcloud_load_balancers" template.
+type DDataList struct {
+	testtemplate.DataCommon
+
+	LabelSelector string
+}
+
+// TFID returns the data source identifier.
+func (d *DDataList) TFID() string {
+	return fmt.Sprintf("data.%s.%s", DataSourceListType, d.RName())
+}
+
+// RData defines the fields for the "testdata/r/hcloud_load_balancer"
+// template.
+type RData struct {
+	testtemplate.DataCommon
+
+	Name             string
+	Type             string
+	LocationName     string
+	NetworkZone      string
+	Algorithm        string
+	ServerTargets    []RDataInlineServerTarget
+	Labels           map[string]string
+	DeleteProtection bool
+}
+
+// TFID returns the resource identifier.
+func (d *RData) TFID() string {
+	return fmt.Sprintf("%s.%s", ResourceType, d.RName())
+}
+
+// RDataInlineServerTarget represents a Load Balancer server target
+// that is added inline to the Load Balancer.
+type RDataInlineServerTarget struct {
+	ServerID string
+}
+
+// RDataService defines the fields for the
+// "testdata/r/hcloud_load_balancer_service" template.
+type RDataService struct {
+	testtemplate.DataCommon
+
+	Name            string
+	LoadBalancerID  string
+	Protocol        string
+	ListenPort      int
+	DestinationPort int
+	Proxyprotocol   bool
+
+	AddHTTP bool // Required as the RLoadBalancerServiceHTTP is not comparable
+	HTTP    RDataServiceHTTP
+
+	AddHealthCheck bool // Required as the RLoadBalancerServiceHealthCheck is not comparable
+	HealthCheck    RDataServiceHealthCheck
+}
+
+// TFID returns the resource identifier.
+func (d *RDataService) TFID() string {
+	return fmt.Sprintf("%s.%s", ServiceResourceType, d.RName())
+}
+
+// RDataServiceHTTP contains data for an HTTP load balancer service.
+type RDataServiceHTTP struct {
+	CookieName     string
+	CookieLifeTime int
+	Certificates   []string
+	RedirectHTTP   bool
+	StickySessions bool
+	TimeoutIdle    int
+}
+
+// RDataServiceHealthCheck contains data for a load balancer service
+// Health Check.
+type RDataServiceHealthCheck struct {
+	Protocol string
+	Port     int
+	Interval int
+	Timeout  int
+	Retries  int
+	HTTP     RDataServiceHealthCheckHTTP
+}
+
+// RDataServiceHealthCheckHTTP contains data for a load balancer service
+// HTTP Health Check.
+type RDataServiceHealthCheckHTTP struct {
+	Domain      string
+	Path        string
+	Response    string
+	TLS         bool
+	StatusCodes []string
+}
+
+// RDataTarget defines the fields for the
+// "testdata/r/hcloud_load_balancer_target" template.
+type RDataTarget struct {
+	testtemplate.DataCommon
+
+	Name           string
+	Type           string
+	LoadBalancerID string
+	ServerID       string
+	LabelSelector  string
+	IP             string
+	UsePrivateIP   bool
+	DependsOn      []string
+}
+
+// TFID returns the resource identifier.
+func (d *RDataTarget) TFID() string {
+	return fmt.Sprintf("%s.%s", TargetResourceType, d.RName())
+}
+
+// RDataNetwork defines the fields for the
+// "testdata/r/hcloud_load_balancer_network" template.
+type RDataNetwork struct {
+	testtemplate.DataCommon
+
+	Name                  string
+	LoadBalancerID        string
+	NetworkID             string
+	SubNetID              string
+	IP                    string
+	EnablePublicInterface *bool
+	DependsOn             []string
+}
+
+// TFID returns the resource identifier.
+func (d *RDataNetwork) TFID() string {
+	return fmt.Sprintf("%s.%s", NetworkResourceType, d.RName())
+}
+
+type Blueprint struct {
+	LoadBalancerA *RData
+	LoadBalancerB *RData
+}
+
+func NewBlueprint(t *testing.T) *Blueprint {
+	t.Helper()
+
+	b := &Blueprint{}
+
+	b.LoadBalancerA = &RData{
+		Name:        "a",
+		Type:        teste2e.TestLoadBalancerType,
+		NetworkZone: "eu-central",
+	}
+	b.LoadBalancerA.SetRName("a")
+
+	b.LoadBalancerB = &RData{
+		Name:        "b",
+		Type:        teste2e.TestLoadBalancerType,
+		NetworkZone: "eu-central",
+	}
+	b.LoadBalancerB.SetRName("b")
+
+	return b
+}

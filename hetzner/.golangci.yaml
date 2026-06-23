@@ -1,0 +1,117 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocritic
+    - gomoddirectives
+    - gomodguard_v2
+    - gosec
+    - gosmopolitan
+    - importas
+    - loggercheck
+    - makezero
+    - musttag
+    - nilerr
+    - nilnesserr
+    - noctx
+    - protogetter
+    - reassign
+    - recvcheck
+    - revive
+    - rowserrcheck
+    - spancheck
+    - sqlclosecheck
+    - testifylint
+    - unparam
+    - zerologlint
+
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: true
+    staticcheck:
+      checks: ["all", "-QF1008", "-S1016"]
+    forbidigo:
+      forbid:
+        # These are not set up and used in our repository,
+        # so we do not have to spend time implementing them and keeping them up to date.
+        - pattern: resource\.AddTestSweepers
+          pkg: github.com/hashicorp/terraform-plugin-testing/helper/resource
+          msg: "Do not implement unused test sweepers"
+      analyze-types: true
+
+    importas:
+      alias:
+        # Do not conflict with github.com/hetznercloud/hcloud-go/v2/hcloud
+        - pkg: github.com/hetznercloud/terraform-provider-hcloud/hcloud
+          alias: tfhcloud
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gosec
+        path: _test\.go
+      - path: testing\.go
+        text: unused-parameter
+      - linters:
+          - testifylint
+        text: bool-compare
+      - linters:
+          - testifylint
+        text: empty
+
+      - linters:
+          - revive
+        path: internal/util/.+\.go
+        text: var-naming
+
+      - linters:
+          - revive
+        text: avoid package names that conflict with Go standard library package names
+
+      # Can be removed once we migrated to the plugin framework.
+      - linters:
+          - errcheck
+        text: Error return value of `d.Set` is not checked
+      - linters:
+          - gosec
+        text: G104
+
+      - linters:
+          - staticcheck
+        text: ServerTypes is deprecated
+
+formatters:
+  enable:
+    - gci
+    - goimports
+
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/hetznercloud)
+
+  exclusions:
+    generated: lax

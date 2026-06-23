@@ -1,0 +1,181 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package ha
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/migration"
+	haresources "github.com/bpg/terraform-provider-proxmox/proxmox/cluster/ha/resources"
+	proxmoxtypes "github.com/bpg/terraform-provider-proxmox/proxmox/types"
+)
+
+// Ensure the implementation satisfies the expected interfaces.
+var (
+	_ datasource.DataSource              = &haResourceDatasource{}
+	_ datasource.DataSourceWithConfigure = &haResourceDatasource{}
+)
+
+// NewHAResourceDataSource is a helper function to simplify the provider implementation.
+func NewHAResourceDataSource() datasource.DataSource {
+	return &haResourceDatasource{}
+}
+
+// haResourceDatasource is the data source implementation for High Availability resources.
+type haResourceDatasource struct {
+	client *haresources.Client
+}
+
+// Metadata returns the data source type name.
+func (d *haResourceDatasource) Metadata(
+	_ context.Context,
+	req datasource.MetadataRequest,
+	resp *datasource.MetadataResponse,
+) {
+	resp.TypeName = req.ProviderTypeName + "_haresource"
+}
+
+// Schema returns the schema for the data source.
+func (d *haResourceDatasource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Description:        "Retrieves information about a specific High Availability resource.",
+		DeprecationMessage: migration.DeprecationMessage("proxmox_haresource"),
+		Attributes: map[string]schema.Attribute{
+			"id": attribute.ResourceID(),
+			"resource_id": schema.StringAttribute{
+				Description: "The identifier of the Proxmox HA resource to read.",
+				Required:    true,
+				Validators: []validator.String{
+					resourceIDValidator(),
+				},
+			},
+			"type": schema.StringAttribute{
+				Description: "The type of High Availability resource (`vm` or `ct`).",
+				Computed:    true,
+			},
+			"comment": schema.StringAttribute{
+				Description: "The comment associated with this resource.",
+				Computed:    true,
+			},
+			"failback": schema.BoolAttribute{
+				Description: "Automatic failback to the preferred node when it becomes available again (PVE 9+).",
+				Computed:    true,
+			},
+			"group": schema.StringAttribute{
+				Description: "The identifier of the High Availability group this resource is a member of.",
+				Computed:    true,
+			},
+			"max_relocate": schema.Int64Attribute{
+				Description: "The maximal number of relocation attempts.",
+				Computed:    true,
+			},
+			"max_restart": schema.Int64Attribute{
+				Description: "The maximal number of restart attempts.",
+				Computed:    true,
+			},
+			"state": schema.StringAttribute{
+				Description: "The desired state of the resource.",
+				Computed:    true,
+			},
+		},
+	}
+}
+
+// Configure adds the provider-configured client to the data source.
+func (d *haResourceDatasource) Configure(
+	_ context.Context,
+	req datasource.ConfigureRequest,
+	resp *datasource.ConfigureResponse,
+) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.DataSource)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected DataSource Configure Type",
+			fmt.Sprintf("Expected config.DataSource, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	d.client = cfg.Client.Cluster().HA().Resources()
+}
+
+// Read fetches the specified HA resource.
+func (d *haResourceDatasource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+	var data ResourceModel
+
+	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resID, err := proxmoxtypes.ParseHAResourceID(data.ResourceID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unexpected error parsing Proxmox HA resource identifier",
+			fmt.Sprintf("Couldn't parse configuration into a valid HA resource identifier: %s", err.Error()),
+		)
+
+		return
+	}
+
+	resource, err := d.client.Get(ctx, resID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			fmt.Sprintf("Unable to read High Availability resource %v", resID),
+			err.Error(),
+		)
+
+		return
+	}
+
+	data.ImportFromAPI(resource)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+// Short-name alias for proxmox_haresource data source (ADR-007).
+
+var (
+	_ datasource.DataSource              = &haResourceDSShort{}
+	_ datasource.DataSourceWithConfigure = &haResourceDSShort{}
+)
+
+type haResourceDSShort struct{ haResourceDatasource }
+
+// NewHAResourceShortDataSource creates the short-name version of the HA resource data source.
+func NewHAResourceShortDataSource() datasource.DataSource {
+	return &haResourceDSShort{}
+}
+
+func (d *haResourceDSShort) Metadata(
+	_ context.Context,
+	_ datasource.MetadataRequest,
+	resp *datasource.MetadataResponse,
+) {
+	resp.TypeName = "proxmox_haresource"
+}
+
+func (d *haResourceDSShort) Schema(
+	ctx context.Context,
+	req datasource.SchemaRequest,
+	resp *datasource.SchemaResponse,
+) {
+	d.haResourceDatasource.Schema(ctx, req, resp)
+	resp.Schema.DeprecationMessage = ""
+}

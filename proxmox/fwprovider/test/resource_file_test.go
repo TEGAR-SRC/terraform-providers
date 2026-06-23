@@ -1,0 +1,357 @@
+//go:build acceptance || all
+
+//testacc:tier=heavy
+//testacc:resource=file
+
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package test
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/ssh"
+	"github.com/bpg/terraform-provider-proxmox/utils"
+)
+
+type nodeResolver struct {
+	node ssh.ProxmoxNode
+}
+
+func (c *nodeResolver) Resolve(_ context.Context, _ string) (ssh.ProxmoxNode, error) {
+	return c.node, nil
+}
+
+func TestAccResourceFile(t *testing.T) {
+	te := InitEnvironment(t)
+
+	snippetRaw := SafeResourceName("snippet-raw") + ".txt"
+	snippetFile1 := strings.ReplaceAll(CreateTempFile(t, "snippet-file-1-*.yaml", "test snippet 1 - file").Name(), `\`, `/`)
+	snippetFile2 := strings.ReplaceAll(CreateTempFile(t, "snippet-file-2-*.yaml", "test snippet 2 - file").Name(), `\`, `/`)
+	fileISO := strings.ReplaceAll(CreateTempFile(t, "file-*.iso", "pretend this is an ISO").Name(), `\`, `/`)
+	sftpOverwriteFile := strings.ReplaceAll(CreateTempFile(t, "sftp-overwrite-*.yaml", "sftp overwrite test").Name(), `\`, `/`)
+	sftpFile := strings.ReplaceAll(CreateTempFile(t, "sftp-file-*.yaml", "sftp upload").Name(), `\`, `/`)
+
+	fileServer := NewTestFileServer(t)
+	if fileServer == nil {
+		t.Skip("PROXMOX_VE_ACC_TEST_FILE_SERVER_IP not set - skipping file resource test")
+	}
+
+	snippetContent := []byte("test: yaml\nkey: value\n")
+	snippetURL := fileServer.AddFile("/229Q.yaml", "229Q.yaml", snippetContent)
+
+	te.AddTemplateVars(map[string]interface{}{
+		"SnippetRaw":        snippetRaw,
+		"SnippetURL":        snippetURL,
+		"SnippetFile1":      snippetFile1,
+		"SnippetFile2":      snippetFile2,
+		"FileISO":           fileISO,
+		"SftpOverwriteFile": sftpOverwriteFile,
+		"SftpFile":          sftpFile,
+	})
+
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: te.AccProviders,
+		PreCheck: func() {
+			uploadSnippetFile(t, snippetFile2)
+			uploadSnippetFile(t, sftpOverwriteFile)
+			t.Cleanup(func() {
+				deleteSnippet(te, filepath.Base(snippetFile1))
+				deleteSnippet(te, filepath.Base(snippetFile2))
+				deleteSnippet(te, filepath.Base(sftpOverwriteFile))
+
+				_ = os.Remove(snippetFile1)
+				_ = os.Remove(snippetFile2)
+				_ = os.Remove(fileISO)
+				_ = os.Remove(sftpOverwriteFile)
+				_ = os.Remove(sftpFile)
+			})
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test_raw" {
+				content_type = "snippets"
+				datastore_id = "local"
+				node_name    = "{{.NodeName}}"
+				source_raw {
+					data = <<EOF
+				test snippet
+					EOF
+					file_name = "{{.SnippetRaw}}"
+				}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test_raw", map[string]string{
+					"content_type":           "snippets",
+					"file_name":              snippetRaw,
+					"source_raw.0.file_name": snippetRaw,
+					"source_raw.0.data":      "test snippet\n",
+					"id":                     fmt.Sprintf("local:snippets/%s", snippetRaw),
+				}),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					source_file {
+					  path = "{{.SnippetFile1}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(snippetFile1),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(snippetFile1)),
+				}),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					source_file {
+					  path = "{{.SnippetURL}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(snippetURL),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(snippetURL)),
+				}),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					source_file {
+					  path = "{{.FileISO}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "iso",
+					"file_name":    filepath.Base(fileISO),
+					"id":           fmt.Sprintf("local:iso/%s", filepath.Base(fileISO)),
+				}),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+				  datastore_id = "local"
+				  node_name    = "{{.NodeName}}"
+				  source_raw {
+					data = <<EOF
+				test snippet
+					EOF
+					file_name = "foo.yaml"
+				  }
+				  source_file {
+					path = "bar.yaml"
+				  }
+				}`),
+				ExpectError: regexp.MustCompile("please specify .* - not both"),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					content_type = "iso"
+					source_file {
+					  path = "https://github.com"
+					}
+				}`),
+				ExpectError: regexp.MustCompile("failed to determine file name from the URL"),
+			},
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+				  datastore_id = "local"
+				  node_name    = "{{.NodeName}}"
+				}`),
+				ExpectError: regexp.MustCompile("missing argument"),
+			},
+			// Do not allow to overwrite the file
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					overwrite    = false
+					source_file {
+					  path = "{{.SnippetFile2}}"
+					}
+				}`),
+				ExpectError: regexp.MustCompile("already exists"),
+			},
+			// Allow to overwrite the file by default
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					source_file {
+					  path = "{{.SnippetFile2}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(snippetFile2),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(snippetFile2)),
+				}),
+			},
+			// Update testing: no original file
+			{
+				PreConfig: func() {
+					_ = os.Remove(snippetFile2)
+					deleteSnippet(te, filepath.Base(snippetFile1))
+				},
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+				  datastore_id = "local"
+				  node_name    = "{{.NodeName}}"
+				  source_file {
+					path = "{{.SnippetFile1}}"
+				  }
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(snippetFile1),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(snippetFile1)),
+				}),
+			},
+			// Update testing: original file
+			{
+				PreConfig: func() {
+					deleteSnippet(te, filepath.Base(snippetFile1))
+				},
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test" {
+				  datastore_id = "local"
+				  node_name    = "{{.NodeName}}"
+				  source_file {
+					path = "{{.SnippetFile1}}"
+				  }
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(snippetFile1),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(snippetFile1)),
+				}),
+			},
+			// SFTP upload mode: file upload
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test_sftp_file" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					upload_mode  = "sftp"
+					source_file {
+					  path = "{{.SftpFile}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test_sftp_file", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(sftpFile),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(sftpFile)),
+				}),
+			},
+			// SFTP upload mode: do not allow to overwrite the file
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test_sftp_overwrite" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					overwrite    = false
+					upload_mode  = "sftp"
+					source_file {
+					  path = "{{.SftpOverwriteFile}}"
+					}
+				}`),
+				ExpectError: regexp.MustCompile("already exists"),
+			},
+			// SFTP upload mode: allow to overwrite the file by default
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_file" "test_sftp_overwrite" {
+					datastore_id = "local"
+					node_name    = "{{.NodeName}}"
+					upload_mode  = "sftp"
+					source_file {
+					  path = "{{.SftpOverwriteFile}}"
+					}
+				}`),
+				Check: ResourceAttributes("proxmox_virtual_environment_file.test_sftp_overwrite", map[string]string{
+					"content_type": "snippets",
+					"file_name":    filepath.Base(sftpOverwriteFile),
+					"id":           fmt.Sprintf("local:snippets/%s", filepath.Base(sftpOverwriteFile)),
+				}),
+			},
+		},
+	})
+}
+
+func uploadSnippetFile(t *testing.T, fileName string) {
+	t.Helper()
+
+	endpoint := utils.GetAnyStringEnv("PROXMOX_VE_ENDPOINT")
+	u, err := url.ParseRequestURI(endpoint)
+	require.NoError(t, err)
+
+	sshAgent := utils.GetAnyBoolEnv("PROXMOX_VE_SSH_AGENT")
+	sshUsername := utils.GetAnyStringEnv("PROXMOX_VE_SSH_USERNAME")
+	sshPassword := utils.GetAnyStringEnv("PROXMOX_VE_SSH_PASSWORD")
+	sshAgentSocket := utils.GetAnyStringEnv("SSH_AUTH_SOCK", "PROXMOX_VE_SSH_AUTH_SOCK")
+	sshAgentForwarding := utils.GetAnyBoolEnv("PROXMOX_VE_SSH_AGENT_FORWARDING")
+	sshPrivateKey := utils.GetAnyStringEnv("PROXMOX_VE_SSH_PRIVATE_KEY")
+	sshPort := utils.GetAnyIntEnv("PROXMOX_VE_ACC_NODE_SSH_PORT")
+	sshClient, err := ssh.NewClient(
+		sshUsername, sshPassword, sshAgent, sshAgentSocket, sshAgentForwarding, sshPrivateKey,
+		"", "", "",
+		&nodeResolver{
+			node: ssh.ProxmoxNode{
+				Address: u.Hostname(),
+				Port:    int32(sshPort),
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	f, err := os.Open(fileName)
+	require.NoError(t, err)
+
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+
+	fname := filepath.Base(fileName)
+	err = sshClient.NodeStreamUpload(context.Background(), "pve", "/var/lib/vz/",
+		&api.FileUploadRequest{
+			ContentType: "snippets",
+			FileName:    fname,
+			File:        f,
+		})
+	require.NoError(t, err)
+}
+
+func deleteSnippet(te *Environment, fname string) {
+	te.t.Helper()
+
+	err := te.NodeStorageClient().DeleteDatastoreFile(context.Background(), fmt.Sprintf("snippets/%s", fname))
+	require.NoError(te.t, err)
+}

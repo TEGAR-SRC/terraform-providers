@@ -1,0 +1,735 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package nodes
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	retry "github.com/avast/retry-go/v5"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/migration"
+	"github.com/bpg/terraform-provider-proxmox/proxmox"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/storage"
+	proxmoxtypes "github.com/bpg/terraform-provider-proxmox/proxmox/types"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/version"
+)
+
+var (
+	_         resource.Resource                = &downloadFileResource{}
+	_         resource.ResourceWithConfigure   = &downloadFileResource{}
+	_         resource.ResourceWithImportState = &downloadFileResource{}
+	httpRegex                                  = regexp.MustCompile(`https?://.*`)
+)
+
+type sizeRequiresReplaceModifier struct{}
+
+func (r sizeRequiresReplaceModifier) PlanModifyInt64(
+	ctx context.Context,
+	req planmodifier.Int64Request,
+	resp *planmodifier.Int64Response,
+) {
+	// Do not replace on resource creation.
+	if req.State.Raw.IsNull() {
+		return
+	}
+
+	// Do not replace on resource destroy.
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var plan, state downloadFileModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+
+	// Check 1: detect if local file in datastore was modified outside of Terraform
+	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
+
+	resp.Diagnostics.Append(diags...)
+
+	if originalStateSizeBytes != nil {
+		originalStateSize, err := strconv.ParseInt(string(originalStateSizeBytes), 10, 64)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Unable to convert original state file size to int64",
+				"Unexpected error in parsing string to int64, key original_state_size. "+
+					"Please retry the operation or report this issue to the provider developers.\n\n"+
+					"Error: "+err.Error(),
+			)
+
+			return
+		}
+
+		if state.Size.ValueInt64() != originalStateSize && plan.Overwrite.ValueBool() {
+			resp.RequiresReplace = true
+			resp.PlanValue = types.Int64Value(originalStateSize)
+
+			resp.Diagnostics.AddWarning(
+				"The file size in datastore has changed outside of terraform.",
+				fmt.Sprintf(
+					"Previous size: %d saved in state does not match current size from datastore: %d. "+
+						"You can disable this behaviour by using overwrite=false",
+					originalStateSize,
+					state.Size.ValueInt64(),
+				),
+			)
+
+			return
+		}
+	}
+
+	// Check 2: detect if upstream file at URL has changed (e.g., new cloud image version)
+	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
+
+	resp.Diagnostics.Append(diags...)
+
+	if urlSizeBytes != nil && plan.URL.ValueString() == state.URL.ValueString() && plan.Overwrite.ValueBool() {
+		urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Unable to convert URL file size to int64",
+				"Unexpected error in parsing string to int64, key url_size. "+
+					"Please retry the operation or report this issue to the provider developers.\n\n"+
+					"Error: "+err.Error(),
+			)
+
+			return
+		}
+
+		// handle error case where URL metadata couldn't be fetched (url_size = -1)
+		if urlSize < 0 {
+			resp.Diagnostics.AddWarning(
+				"Could not read the file metadata from URL.",
+				fmt.Sprintf(
+					"The remote file at URL %q most likely doesn't exist or can't be accessed.\n"+
+						"To skip the remote file check, set `overwrite` to `false`.",
+					plan.URL.ValueString(),
+				),
+			)
+
+			return
+		}
+
+		if state.Size.ValueInt64() != urlSize {
+			resp.RequiresReplace = true
+			resp.PlanValue = types.Int64Value(urlSize)
+
+			resp.Diagnostics.AddWarning(
+				"The file size from URL has changed.",
+				fmt.Sprintf(
+					"Size %d from URL %q does not match size %d from datastore. "+
+						"You can disable this behaviour by using overwrite=false",
+					urlSize,
+					plan.URL.ValueString(),
+					state.Size.ValueInt64(),
+				),
+			)
+
+			return
+		}
+	}
+}
+
+func (r sizeRequiresReplaceModifier) Description(_ context.Context) string {
+	return "Triggers resource force replacement if `size` in state does not match remote value."
+}
+
+func (r sizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
+	return "Triggers resource force replacement if `size` in state does not match remote value."
+}
+
+type downloadFileModel struct {
+	ID                     types.String `tfsdk:"id"`
+	ContentType            types.String `tfsdk:"content_type"`
+	FileName               types.String `tfsdk:"file_name"`
+	Storage                types.String `tfsdk:"datastore_id"`
+	Node                   types.String `tfsdk:"node_name"`
+	Size                   types.Int64  `tfsdk:"size"`
+	URL                    types.String `tfsdk:"url"`
+	Checksum               types.String `tfsdk:"checksum"`
+	DecompressionAlgorithm types.String `tfsdk:"decompression_algorithm"`
+	UploadTimeout          types.Int64  `tfsdk:"upload_timeout"`
+	ChecksumAlgorithm      types.String `tfsdk:"checksum_algorithm"`
+	Verify                 types.Bool   `tfsdk:"verify"`
+	Overwrite              types.Bool   `tfsdk:"overwrite"`
+	OverwriteUnmanaged     types.Bool   `tfsdk:"overwrite_unmanaged"`
+}
+
+// NewDownloadFileResource manages files downloaded using Proxmox API.
+func NewDownloadFileResource() resource.Resource {
+	return &downloadFileResource{}
+}
+
+type downloadFileResource struct {
+	client proxmox.Client
+}
+
+func (r *downloadFileResource) Metadata(
+	_ context.Context,
+	req resource.MetadataRequest,
+	resp *resource.MetadataResponse,
+) {
+	resp.TypeName = req.ProviderTypeName + "_download_file"
+}
+
+// Schema defines the schema for the resource.
+func (r *downloadFileResource) Schema(
+	_ context.Context,
+	_ resource.SchemaRequest,
+	resp *resource.SchemaResponse,
+) {
+	resp.Schema = schema.Schema{
+		DeprecationMessage: migration.DeprecationMessage("proxmox_download_file"),
+		Description:        "Manages files upload using PVE download-url API. ",
+		MarkdownDescription: "Manages files upload using PVE download-url API. " +
+			"It can be fully compatible and faster replacement for image files created using " +
+			"`proxmox_virtual_environment_file`. Supports images for VMs (ISO and disk images) and LXC (CT Templates).",
+		Attributes: map[string]schema.Attribute{
+			"id": attribute.ResourceID(),
+			"content_type": schema.StringAttribute{
+				Description: "The file content type. Must be `iso` or `import` for VM images or `vztmpl` for LXC images.",
+				Required:    true,
+				Validators: []validator.String{stringvalidator.OneOf([]string{
+					"iso",
+					"vztmpl",
+					"import",
+				}...)},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"file_name": schema.StringAttribute{
+				Description: "The file name. If not provided, it is calculated " +
+					"using `url`. PVE will raise 'wrong file extension' error for some popular " +
+					"extensions file `.raw` or `.qcow2` on PVE versions prior to 8.4. " +
+					"Workaround is to use e.g. `.img` instead.",
+				Computed: true,
+				Required: false,
+				Optional: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"datastore_id": schema.StringAttribute{
+				Description: "The identifier for the target datastore.",
+				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"node_name": schema.StringAttribute{
+				Description: "The node name.",
+				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"size": schema.Int64Attribute{
+				Description: "The file size in PVE.",
+				Optional:    false,
+				Required:    false,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+					sizeRequiresReplaceModifier{},
+				},
+			},
+			"upload_timeout": schema.Int64Attribute{
+				Description: "The file download timeout seconds. Default is 600 (10min).",
+				Optional:    true,
+				Computed:    true,
+				Default:     int64default.StaticInt64(600),
+			},
+			"url": schema.StringAttribute{
+				Description: "The URL to download the file from. Must match regex: `" + httpRegex.String() + "`.",
+				Required:    true,
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(httpRegex, "must match HTTP URL regex `"+httpRegex.String()+"`"),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"checksum": schema.StringAttribute{
+				Description: "The expected checksum of the file.",
+				Optional:    true,
+				Default:     nil,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Validators: []validator.String{
+					stringvalidator.AlsoRequires(path.MatchRoot("checksum_algorithm")),
+				},
+			},
+			"decompression_algorithm": schema.StringAttribute{
+				Description: "Decompress the downloaded file using the " +
+					"specified compression algorithm. Must be one of `gz` | `lzo` | `zst` | `bz2`.",
+				Optional: true,
+				Default:  nil,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Validators: []validator.String{
+					stringvalidator.OneOf([]string{
+						"gz",
+						"lzo",
+						"zst",
+						"bz2",
+					}...),
+				},
+			},
+			"checksum_algorithm": schema.StringAttribute{
+				Description: "The algorithm to calculate the checksum of the file. " +
+					"Must be `md5` | `sha1` | `sha224` | `sha256` | `sha384` | `sha512`.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf([]string{
+						"md5",
+						"sha1",
+						"sha224",
+						"sha256",
+						"sha384",
+						"sha512",
+					}...),
+					stringvalidator.AlsoRequires(path.MatchRoot("checksum")),
+				},
+				Default: nil,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"verify": schema.BoolAttribute{
+				Description: "By default `true`. If `false`, no SSL/TLS certificates will be verified.",
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(true),
+			},
+			"overwrite": schema.BoolAttribute{
+				Description: "By default `true`. If `true`, the file will be replaced when either: " +
+					"(1) the file size in the datastore has changed outside of Terraform, or " +
+					"(2) the file size reported by the URL differs from the downloaded file " +
+					"(detecting upstream updates like new cloud image versions). " +
+					"If `false`, no size checks are performed and the file is never automatically replaced.",
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(true),
+			},
+			"overwrite_unmanaged": schema.BoolAttribute{
+				Description: "If `true` and a file with the same name already exists in the datastore, " +
+					"it will be deleted and the new file will be downloaded. If `false` and the file already exists, " +
+					"an error will be returned.",
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+			},
+		},
+	}
+}
+
+func (r *downloadFileResource) Configure(
+	_ context.Context,
+	req resource.ConfigureRequest,
+	resp *resource.ConfigureResponse,
+) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.Resource)
+
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected *proxmox.Client, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	r.client = cfg.Client
+}
+
+func (r *downloadFileResource) Create(
+	ctx context.Context,
+	req resource.CreateRequest,
+	resp *resource.CreateResponse,
+) {
+	var plan downloadFileModel
+
+	diags := req.Plan.Get(ctx, &plan)
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	timeout := time.Duration(plan.UploadTimeout.ValueInt64()) * time.Second
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	fileMetadata, err := r.getURLMetadata(
+		ctx,
+		&plan,
+	)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error initiating file download",
+			"Could not get file metadata, unexpected error: "+err.Error(),
+		)
+
+		return
+	}
+
+	if plan.FileName.IsUnknown() {
+		plan.FileName = types.StringValue(*fileMetadata.Filename)
+	}
+
+	nodesClient := r.client.Node(plan.Node.ValueString())
+	verify := proxmoxtypes.CustomBool(plan.Verify.ValueBool())
+
+	downloadFileReq := storage.DownloadURLPostRequestBody{
+		Node:              plan.Node.ValueStringPointer(),
+		Storage:           plan.Storage.ValueStringPointer(),
+		Content:           plan.ContentType.ValueStringPointer(),
+		Checksum:          plan.Checksum.ValueStringPointer(),
+		ChecksumAlgorithm: plan.ChecksumAlgorithm.ValueStringPointer(),
+		Compression:       plan.DecompressionAlgorithm.ValueStringPointer(),
+		FileName:          plan.FileName.ValueStringPointer(),
+		URL:               plan.URL.ValueStringPointer(),
+		Verify:            &verify,
+	}
+
+	storageClient := nodesClient.Storage(plan.Storage.ValueString())
+
+	err = storageClient.DownloadFileByURL(ctx, &downloadFileReq)
+	if isErrFileAlreadyExists(err) && plan.OverwriteUnmanaged.ValueBool() {
+		fileID := plan.ContentType.ValueString() + "/" + plan.FileName.ValueString()
+
+		err = storageClient.DeleteDatastoreFile(ctx, fileID)
+		if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.Diagnostics.AddError("Error deleting file from datastore",
+				fmt.Sprintf("Could not delete file '%s', unexpected error: %s", fileID, err.Error()),
+			)
+		}
+
+		err = storageClient.DownloadFileByURL(ctx, &downloadFileReq)
+	}
+
+	if err != nil {
+		if isErrFileAlreadyExists(err) {
+			resp.Diagnostics.AddError(
+				"File already exists in the datastore, it was created outside of Terraform "+
+					"or is managed by another resource.",
+				fmt.Sprintf("File already exists in the datastore: '%s', error: %s",
+					plan.FileName.ValueString(), err.Error(),
+				),
+			)
+		} else {
+			ver := version.MinimumProxmoxVersion
+			if versionResp, err := r.client.Version().Version(ctx); err == nil {
+				ver = versionResp.Version
+			} else {
+				tflog.Warn(ctx, "Failed to determine Proxmox VE version, assuming minimum supported version.", map[string]any{
+					"error":           err,
+					"assumed_version": ver.String(),
+				})
+			}
+
+			message := fmt.Sprintf("Could not download file '%s', unexpected error: %s",
+				plan.FileName.ValueString(), err.Error(),
+			)
+			if plan.ContentType.ValueString() == "import" && !ver.SupportImportContentType() {
+				message += ", and the content type 'import' is not supported by the Proxmox VE version " + ver.String()
+			}
+
+			resp.Diagnostics.AddError("Error downloading file from url", message)
+		}
+
+		return
+	}
+
+	plan.ID = types.StringValue(plan.Storage.ValueString() + ":" +
+		plan.ContentType.ValueString() + "/" + plan.FileName.ValueString())
+
+	// Retry with backoff: distributed storage (Ceph) may not list the file immediately after download.
+	err = retry.New(
+		retry.Context(ctx),
+		retry.Attempts(5),
+		retry.Delay(200*time.Millisecond),
+		retry.DelayType(retry.BackOffDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			tflog.Warn(ctx, "file not yet visible in datastore listing after download, retrying",
+				map[string]any{"attempt": n + 1})
+		}),
+	).Do(func() error {
+		return r.read(ctx, &plan)
+	})
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error when reading file from datastore", err.Error(),
+		)
+	}
+
+	resp.State.Set(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+}
+
+func (r *downloadFileResource) getURLMetadata(
+	ctx context.Context,
+	model *downloadFileModel,
+) (*nodes.QueryURLMetadataGetResponseData, error) {
+	nodesClient := r.client.Node(model.Node.ValueString())
+	verify := proxmoxtypes.CustomBool(model.Verify.ValueBool())
+
+	queryURLMetadataReq := nodes.QueryURLMetadataGetRequestBody{
+		URL:    model.URL.ValueString(),
+		Verify: &verify,
+	}
+
+	fileMetadata, err := nodesClient.GetQueryURLMetadata(
+		ctx,
+		&queryURLMetadataReq,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"error fetching metadata from download url, "+
+				"unexpected error in GetQueryURLMetadata: %w",
+			err,
+		)
+	}
+
+	return fileMetadata, nil
+}
+
+func (r *downloadFileResource) read(
+	ctx context.Context,
+	model *downloadFileModel,
+) error {
+	nodesClient := r.client.Node(model.Node.ValueString())
+	storageClient := nodesClient.Storage(model.Storage.ValueString())
+
+	contentType := model.ContentType.ValueString()
+
+	datastoresFiles, err := storageClient.ListDatastoreFiles(ctx, &contentType)
+	if err != nil {
+		return fmt.Errorf("unexpected error when listing datastore files: %w", err)
+	}
+
+	for _, file := range datastoresFiles {
+		if file != nil {
+			if file.VolumeID != model.ID.ValueString() {
+				continue
+			}
+
+			model.Size = types.Int64Value(file.FileSize)
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("file does not exists in datastore")
+}
+
+// Read reads file from datastore.
+func (r *downloadFileResource) Read(
+	ctx context.Context,
+	req resource.ReadRequest,
+	resp *resource.ReadResponse,
+) {
+	var state downloadFileModel
+
+	diags := req.State.Get(ctx, &state)
+
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	setOriginalValue := []byte(strconv.FormatInt(state.Size.ValueInt64(), 10))
+	resp.Private.SetKey(ctx, "original_state_size", setOriginalValue)
+
+	err := r.read(ctx, &state)
+	if err != nil {
+		if strings.Contains(err.Error(), "failed to authenticate") {
+			resp.Diagnostics.AddError("Failed to authenticate", err.Error())
+
+			return
+		}
+
+		resp.Diagnostics.AddWarning(
+			"The file does not exist in datastore and resource must be recreated.",
+			err.Error(),
+		)
+		resp.State.RemoveResource(ctx)
+
+		return
+	}
+
+	// check upstream URL for file size changes when overwrite is enabled
+	if state.Overwrite.ValueBool() {
+		urlMetadata, err := r.getURLMetadata(ctx, &state)
+		if err != nil {
+			tflog.Warn(ctx, "Could not get file metadata from url", map[string]any{
+				"error": err,
+				"url":   state.URL.ValueString(),
+			})
+			// set url_size to -1 to indicate error (used in plan modifier to show warning)
+			resp.Private.SetKey(ctx, "url_size", []byte("-1"))
+		} else if urlMetadata.Size != nil {
+			setValue := []byte(strconv.FormatInt(*urlMetadata.Size, 10))
+			resp.Private.SetKey(ctx, "url_size", setValue)
+		}
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
+}
+
+// Update file resource.
+func (r *downloadFileResource) Update(
+	ctx context.Context,
+	req resource.UpdateRequest,
+	resp *resource.UpdateResponse,
+) {
+	var plan, state downloadFileModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	err := r.read(ctx, &plan)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error when reading file from datastore", err.Error(),
+		)
+
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// Delete removes file resource.
+//
+//nolint:dupl // delete path mirrors OCI image resource implementation
+func (r *downloadFileResource) Delete(
+	ctx context.Context,
+	req resource.DeleteRequest,
+	resp *resource.DeleteResponse,
+) {
+	var state downloadFileModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	nodesClient := r.client.Node(state.Node.ValueString())
+	storageClient := nodesClient.Storage(state.Storage.ValueString())
+
+	err := storageClient.DeleteDatastoreFile(
+		ctx,
+		state.ID.ValueString(),
+	)
+	if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
+		if strings.Contains(err.Error(), "unable to parse") {
+			resp.Diagnostics.AddWarning(
+				"Datastore file does not exists",
+				fmt.Sprintf(
+					"Could not delete datastore file '%s', it does not exist or has been deleted outside of Terraform.",
+					state.ID.ValueString(),
+				),
+			)
+		} else {
+			resp.Diagnostics.AddError(
+				"Error deleting datastore file",
+				fmt.Sprintf("Could not delete datastore file '%s', unexpected error: %s",
+					state.ID.ValueString(), err.Error()),
+			)
+		}
+	}
+}
+
+func isErrFileAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return strings.Contains(err.Error(), "refusing to override existing file")
+}
+
+// ImportState imports a download file resource using the format node_name/datastore_id:content_type/file_name,
+// where the part after the node name is the resource id.
+func (r *downloadFileResource) ImportState(
+	ctx context.Context,
+	req resource.ImportStateRequest,
+	resp *resource.ImportStateResponse,
+) {
+	const format = "node_name/datastore_id:content_type/file_name"
+
+	nodeName, id, found := strings.Cut(req.ID, "/")
+	if !found || nodeName == "" || id == "" {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			fmt.Sprintf("Expected import identifier with format: %s. Got: %q", format, req.ID),
+		)
+
+		return
+	}
+
+	datastoreID, filePart, found := strings.Cut(id, ":")
+	if !found || datastoreID == "" || filePart == "" {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			fmt.Sprintf("Expected import identifier with format: %s. Got: %q", format, req.ID),
+		)
+
+		return
+	}
+
+	contentType, fileName, found := strings.Cut(filePart, "/")
+	if !found || contentType == "" || fileName == "" {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			fmt.Sprintf("Expected import identifier with format: %s. Got: %q", format, req.ID),
+		)
+
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("node_name"), nodeName)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("datastore_id"), datastoreID)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("content_type"), contentType)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("file_name"), fileName)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
+}

@@ -1,0 +1,215 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	crsdk "github.com/ionos-cloud/sdk-go-bundle/products/containerregistry/v2"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	crservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/containerregistry"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceContainerRegistry() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceContainerRegistryRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"partial_match": {
+				Type:        schema.TypeBool,
+				Description: "Whether partial matching is allowed or not when using name argument.",
+				Default:     false,
+				Optional:    true,
+			},
+			"location": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"api_subnet_allow_list": {
+				Type:        schema.TypeList,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Computed:    true,
+				Description: "The subnet CIDRs that are allowed to connect to the registry. Specify 'a.b.c.d/32' for an individual IP address. __Note__: If this list is empty or not set, there are no restrictions.",
+			},
+			"garbage_collection_schedule": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"time": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"days": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem: &schema.Schema{
+								Type: schema.TypeString,
+							},
+						},
+					},
+				},
+			},
+			"hostname": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"maintenance_window": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"time": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"days": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem: &schema.Schema{
+								Type: schema.TypeString,
+							},
+						},
+					},
+				},
+			},
+			"storage_usage": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"bytes": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"updated_at": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
+			},
+			"features": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"vulnerability_scanning": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+//nolint:gocyclo
+func dataSourceContainerRegistryRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	idValue, idOk := d.GetOk("id")
+	nameValue, nameOk := d.GetOk("name")
+	locationValue, locationOk := d.GetOk("location")
+
+	id := idValue.(string)
+	name := nameValue.(string)
+	location := locationValue.(string)
+
+	client, err := meta.(bundleclient.SdkBundle).NewContainerRegistryClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	if idOk && (nameOk || locationOk) {
+		return diagutil.ToDiags(d, fmt.Errorf("id and name or location cannot be both specified in the same time"), nil)
+	}
+	if !idOk && !nameOk && !locationOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide the registry id, name or location"), nil)
+	}
+
+	var registry crsdk.RegistryResponse
+	var apiResponse *shared.APIResponse
+
+	if idOk {
+		/* search by ID */
+		registry, apiResponse, err = client.GetRegistry(ctx, id)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching the registry with ID %s: %w", id, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+	} else {
+		var results []crsdk.RegistryResponse
+
+		registries, apiResponse, err := client.ListRegistries(ctx)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching container registries: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+
+		results = registries.Items
+		if nameOk {
+			partialMatch := d.Get("partial_match").(bool)
+
+			tflog.Info(ctx, "searching container registry by name", map[string]any{"partial_match": partialMatch, "name": name})
+
+			if registries.Items != nil && len(registries.Items) > 0 {
+				var registriesByName []crsdk.RegistryResponse
+				for _, registryItem := range registries.Items {
+					if partialMatch && strings.Contains(registryItem.Properties.Name, name) ||
+						!partialMatch && strings.EqualFold(registryItem.Properties.Name, name) {
+						registriesByName = append(registriesByName, registryItem)
+					}
+				}
+				if len(registriesByName) > 0 {
+					results = registriesByName
+				} else {
+					return diagutil.ToDiags(d, fmt.Errorf("no registry found with the specified criteria: name = %v", name), nil)
+				}
+			}
+		}
+
+		if locationOk {
+			var registriesByLocation []crsdk.RegistryResponse
+			for _, registryItem := range results {
+				if strings.EqualFold(registryItem.Properties.Location, location) {
+					registriesByLocation = append(registriesByLocation, registryItem)
+				}
+			}
+			if len(registriesByLocation) > 0 {
+				results = registriesByLocation
+			} else {
+				return diagutil.ToDiags(d, fmt.Errorf("no registry found with the specified criteria: location = %v", location), nil)
+			}
+		}
+
+		switch {
+		case len(results) == 0:
+			return diagutil.ToDiags(d, fmt.Errorf("no registry found with the specified criteria: name = %s location = %s", name, location), nil)
+		case len(results) > 1:
+			return diagutil.ToDiags(d, fmt.Errorf("more than one registry found with the specified criteria: name = %s location = %s", name, location), nil)
+		default:
+			registry = results[0]
+		}
+	}
+
+	if err := crservice.SetRegistryData(d, registry); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+
+}

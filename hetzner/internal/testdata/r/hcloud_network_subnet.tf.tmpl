@@ -1,0 +1,16 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_network_subnet" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  type         = "{{ .Type }}"
+  network_id   = {{ .NetworkID }}
+  network_zone = "{{ .NetworkZone }}"
+  ip_range     = "{{ .IPRange }}"
+  {{- if .VSwitchID }}
+  vswitch_id   = {{ .VSwitchID }}
+  {{ end }}
+
+  {{- if .DependsOn }}
+  depends_on               = [{{ .DependsOn | join ", " }}]
+  {{ end }}
+}

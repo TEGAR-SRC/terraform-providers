@@ -1,0 +1,142 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/nsg"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/uuidgen"
+)
+
+func resourceDatacenterNSGSelection() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceDatacenterNSGSelectionCreate,
+		ReadContext:   resourceDatacenterNSGSelectionRead,
+		UpdateContext: resourceDatacenterNSGSelectionUpdate,
+		DeleteContext: resourceDatacenterNSGSelectionDelete,
+		Schema: map[string]*schema.Schema{
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+				ForceNew:    true,
+			},
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Description:      "ID of the Datacenter to which the NSG will be attached.",
+				Required:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+			},
+			"nsg_id": {
+				Type:             schema.TypeString,
+				Description:      "ID of the NSG which will be attached to the datacenter. If an empty string is specified and a NSG was attached previously, it will be unset.",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.Any(validation.IsUUID, validation.StringIsEmpty)),
+			},
+		},
+
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+func resourceDatacenterNSGSelectionCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	dcID := d.Get("datacenter_id").(string)
+	nsgID := d.Get("nsg_id").(string)
+	location := d.Get("location").(string)
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	ns := nsg.Service{Client: client, Meta: meta, D: d}
+	if diags := ns.SetDefaultDatacenterNSG(ctx, dcID, nsgID); diags.HasError() {
+		return diags
+	}
+
+	d.SetId(uuidgen.ResourceUuid().String())
+	return resourceDatacenterNSGSelectionRead(ctx, d, meta)
+}
+
+func resourceDatacenterNSGSelectionRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	dcID := d.Get("datacenter_id").(string)
+	nsgID := d.Get("nsg_id").(string)
+	location := d.Get("location").(string)
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	datacenter, apiResponse, err := client.DataCentersApi.DatacentersFindById(ctx, dcID).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if err = setDatacenterDefaultNSGSelectionData(d, &datacenter); err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("error reading default NSG for datacenter, dcID: %s, sID: %s, (%w)", dcID, nsgID, err), nil)
+	}
+	return nil
+}
+
+func resourceDatacenterNSGSelectionUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	dcID := d.Get("datacenter_id").(string)
+	location := d.Get("location").(string)
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	if d.HasChange("nsg_id") {
+		_, newID := d.GetChange("nsg_id")
+		ns := nsg.Service{Client: client, Meta: meta, D: d}
+		if diags := ns.SetDefaultDatacenterNSG(ctx, dcID, newID.(string)); diags.HasError() {
+			return diags
+		}
+	}
+
+	return resourceDatacenterNSGSelectionRead(ctx, d, meta)
+
+}
+
+func resourceDatacenterNSGSelectionDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	dcID := d.Get("datacenter_id").(string)
+	location := d.Get("location").(string)
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	ns := nsg.Service{Client: client, Meta: meta, D: d}
+	if diags := ns.SetDefaultDatacenterNSG(ctx, dcID, ""); diags.HasError() {
+		return diags
+	}
+	d.SetId("")
+
+	return nil
+}
+
+func setDatacenterDefaultNSGSelectionData(d *schema.ResourceData, datacenter *ionoscloud.Datacenter) error {
+
+	if datacenter.Properties.DefaultSecurityGroupId != nil {
+		if err := d.Set("nsg_id", *datacenter.Properties.DefaultSecurityGroupId); err != nil {
+			return err
+		}
+		return nil
+	}
+	return nil
+}

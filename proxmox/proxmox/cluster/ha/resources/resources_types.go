@@ -1,0 +1,95 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package resources
+
+import (
+	"github.com/bpg/terraform-provider-proxmox/proxmox/types"
+)
+
+// HAResourceListResponseBody contains the body from a HA resource list response.
+type HAResourceListResponseBody struct {
+	Data []*HAResourceListResponseData `json:"data,omitempty"`
+}
+
+// HAResourceListResponseData contains the data from a HA resource list response.
+type HAResourceListResponseData struct {
+	ID types.HAResourceID `json:"sid"`
+}
+
+// HAResourceGetResponseBody contains the body from a HA resource get response.
+type HAResourceGetResponseBody struct {
+	Data *HAResourceGetResponseData `json:"data,omitempty"`
+}
+
+// HAResourceDataBase contains data common to all HA resource API calls.
+type HAResourceDataBase struct {
+	// Resource comment, if defined
+	Comment *string `json:"comment,omitempty" url:"comment,omitempty"`
+	// Automatic failback to the preferred node when it becomes available again
+	Failback *types.CustomBool `json:"failback,omitempty" url:"failback,omitempty,int"`
+	// HA group identifier, if the resource is part of one.
+	Group *string `json:"group,omitempty" url:"group,omitempty"`
+	// Maximal number of service relocation attempts.
+	MaxRelocate *int64 `json:"max_relocate,omitempty" url:"max_relocate,omitempty"`
+	// Maximal number of service restart attempts.
+	MaxRestart *int64 `json:"max_restart" url:"max_restart,omitempty"`
+	// Requested resource state.
+	State types.HAResourceState `json:"state" url:"state"`
+}
+
+// HAResourceGetResponseData contains data received from the HA resource API when requesting information about a single
+// HA resource.
+type HAResourceGetResponseData struct {
+	HAResourceDataBase
+
+	// Identifier of this resource
+	ID types.HAResourceID `json:"sid"`
+	// Type of this resource
+	Type types.HAResourceType `json:"type"`
+	// SHA-1 digest of the resources' configuration.
+	Digest *string `json:"digest,omitempty"`
+}
+
+// HAResourceCreateRequestBody contains data received from the HA resource API when creating a new HA resource.
+type HAResourceCreateRequestBody struct {
+	HAResourceDataBase
+
+	// Identifier of this resource
+	ID types.HAResourceID `url:"sid"`
+	// Type of this resource
+	Type *types.HAResourceType `url:"type,omitempty"`
+	// SHA-1 digest of the resources' configuration.
+	Digest *string `url:"comment,omitempty"`
+}
+
+// HAResourceUpdateRequestBody contains data received from the HA resource API when updating an existing HA resource.
+type HAResourceUpdateRequestBody struct {
+	HAResourceDataBase
+
+	// Settings that must be deleted from the resource's configuration
+	Delete []string `url:"delete,omitempty,comma"`
+}
+
+// HAResourceMigrateRequestBody contains data for the HA resource migrate request.
+type HAResourceMigrateRequestBody struct {
+	// Target node for the migration.
+	Node string `url:"node"`
+}
+
+// HAResourceMigrateResponseData contains the data from an HA resource migrate response.
+// In PVE 9.x, the response returns an object with the resource ID and requested node.
+type HAResourceMigrateResponseData struct {
+	// Resource ID that was requested to migrate
+	SID string `json:"sid,omitempty"`
+	// Target node that was requested
+	RequestedNode string `json:"requested-node,omitempty"`
+}
+
+// HAResourceMigrateResponseBody contains the body from an HA resource migrate response.
+type HAResourceMigrateResponseBody struct {
+	Data *HAResourceMigrateResponseData `json:"data,omitempty"`
+}

@@ -1,0 +1,130 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	certsdk "github.com/ionos-cloud/sdk-go-bundle/products/cert/v2"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	certservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cert"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceCertificateManagerProvider() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceProviderRead,
+		Schema: map[string]*schema.Schema{
+			"location": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The location of the auto-certificate provider",
+			},
+			"id": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+				Description:      "The ID of the auto-certificate provider",
+			},
+			"name": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				Description: "The name of the auto-certificate provider",
+			},
+			"email": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "The email address of the certificate requester",
+			},
+			"server": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "The URL of the certificate provider",
+			},
+			"external_account_binding": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"key_id": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Description: "The key ID of the external account binding",
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceProviderRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+	id, idOk := d.GetOk("id")
+	name, nameOk := d.GetOk("name")
+	location := d.Get("location").(string)
+
+	if idOk && nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("ID and name cannot be provided at the same time"), nil)
+	}
+	if !idOk && !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide either the auto-certificate provider ID or name"), nil)
+	}
+
+	var provider certsdk.ProviderRead
+	var apiResponse *shared.APIResponse
+	var err error
+
+	if idOk {
+		id := id.(string)
+		provider, apiResponse, err = client.GetProvider(ctx, id, location)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching the auto-certificate provider with ID: %v, error: %w", id, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+	} else {
+		providers, apiResponse, err := client.ListProviders(ctx, location)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching auto-certificate providers: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		var results []certsdk.ProviderRead
+		if providers.Items != nil {
+			for _, providerItem := range providers.Items {
+				if strings.EqualFold(providerItem.Properties.Name, name.(string)) {
+					results = append(results, providerItem)
+				}
+			}
+		}
+
+		if len(results) == 0 {
+			return diagutil.ToDiags(d, fmt.Errorf("no auto-certificate provider found with the specified name: %v", name), nil)
+		}
+		if len(results) > 1 {
+			return diagutil.ToDiags(d, fmt.Errorf("more than one auto-certificate provider found with the specified name: %v", name), nil)
+		}
+		provider = results[0]
+	}
+
+	if err := certservice.SetProviderData(d, provider); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	if provider.Properties.ExternalAccountBinding != nil {
+		var externalAccountBinding []any
+		externalAccountBindingEntry := map[string]any{}
+		utils.SetPropWithNilCheck(externalAccountBindingEntry, "key_id", *provider.Properties.ExternalAccountBinding.KeyId)
+		externalAccountBinding = append(externalAccountBinding, externalAccountBindingEntry)
+		if err := d.Set("external_account_binding", externalAccountBinding); err != nil {
+			return diagutil.ToDiags(d, utils.GenerateSetError("Auto-certificate provider", "external_account_binding", err), nil)
+		}
+	}
+	return nil
+}

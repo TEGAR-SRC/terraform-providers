@@ -1,0 +1,20 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_network" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  name     = "{{ .Name }}--{{ .RInt }}"
+  ip_range = "{{ .IPRange }}"
+
+  {{- /* Optional properties */}}
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+
+  {{- if .DeleteProtection }}
+  delete_protection = {{ .DeleteProtection }}
+  {{ end }}
+
+  {{- if .ExposeRoutesToVSwitch }}
+  expose_routes_to_vswitch = {{ .ExposeRoutesToVSwitch }}
+  {{ end }}
+}

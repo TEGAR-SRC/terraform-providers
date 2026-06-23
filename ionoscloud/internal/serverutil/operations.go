@@ -1,0 +1,71 @@
+package serverutil
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func SetServerVolumeProperties(volume ionoscloud.Volume) map[string]any {
+	volumeMap := map[string]any{}
+	if volume.Properties != nil {
+		utils.SetPropWithNilCheck(volumeMap, "name", volume.Properties.Name)
+		utils.SetPropWithNilCheck(volumeMap, "disk_type", volume.Properties.Type)
+		utils.SetPropWithNilCheck(volumeMap, "pci_slot", volume.Properties.PciSlot)
+		utils.SetPropWithNilCheck(volumeMap, "licence_type", volume.Properties.LicenceType)
+		utils.SetPropWithNilCheck(volumeMap, "bus", volume.Properties.Bus)
+		utils.SetPropWithNilCheck(volumeMap, "availability_zone", volume.Properties.AvailabilityZone)
+		utils.SetPropWithNilCheck(volumeMap, "cpu_hot_plug", volume.Properties.CpuHotPlug)
+		utils.SetPropWithNilCheck(volumeMap, "ram_hot_plug", volume.Properties.RamHotPlug)
+		utils.SetPropWithNilCheck(volumeMap, "nic_hot_plug", volume.Properties.NicHotPlug)
+		utils.SetPropWithNilCheck(volumeMap, "nic_hot_unplug", volume.Properties.NicHotUnplug)
+		utils.SetPropWithNilCheck(volumeMap, "disc_virtio_hot_plug", volume.Properties.DiscVirtioHotPlug)
+		utils.SetPropWithNilCheck(volumeMap, "disc_virtio_hot_unplug", volume.Properties.DiscVirtioHotUnplug)
+		utils.SetPropWithNilCheck(volumeMap, "device_number", volume.Properties.DeviceNumber)
+		utils.SetPropWithNilCheck(volumeMap, "user_data", volume.Properties.UserData)
+		utils.SetPropWithNilCheck(volumeMap, "backup_unit_id", volume.Properties.BackupunitId)
+		utils.SetPropWithNilCheck(volumeMap, "boot_server", volume.Properties.BootServer)
+		utils.SetPropWithNilCheck(volumeMap, "expose_serial", volume.Properties.ExposeSerial)
+		utils.SetPropWithNilCheck(volumeMap, "require_legacy_bios", volume.Properties.RequireLegacyBios)
+	}
+	return volumeMap
+}
+
+func ResourceCommonServerDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	dcID := d.Get("datacenter_id").(string)
+
+	apiResponse, err := client.ServersApi.DatacentersServersDelete(ctx, dcID, d.Id()).Execute()
+	if apiResponse != nil {
+		tflog.Debug(ctx, "api request completed", map[string]any{
+			"request_time": apiResponse.RequestTime.String(),
+			"operation":    apiResponse.Operation,
+			"status_code":  apiResponse.SafeStatusCode(),
+		})
+	}
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while deleting a server: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutDelete); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error getting state change for server delete %w", errState), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	d.SetId("")
+	return nil
+}

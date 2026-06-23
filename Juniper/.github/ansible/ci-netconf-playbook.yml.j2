@@ -1,0 +1,91 @@
+- name: Render generated Junos configuration XML
+  hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    tmp_dir: configs
+    generated_role_name: "[[ generated_role_name ]]"
+    jtaf_vars_root: "{{ playbook_dir }}"
+  pre_tasks:
+    - name: Initialize explicit variable layers
+      set_fact:
+        jtaf_group_all: {}
+        jtaf_group_merged: {}
+        jtaf_host_vars: {}
+
+    - name: Load global group vars
+      set_fact:
+        jtaf_group_all: "{{ lookup('file', jtaf_group_all_file) | from_yaml }}"
+      vars:
+        jtaf_group_all_file: "{{ jtaf_vars_root }}/group_vars/all.yaml"
+      when: (query('ansible.builtin.fileglob', jtaf_group_all_file) | length) > 0
+
+    - name: Merge group vars for each inventory group
+      set_fact:
+        jtaf_group_merged: "{{ jtaf_group_merged | combine(lookup('file', jtaf_group_file) | from_yaml, recursive=True, list_merge='append') }}"
+      vars:
+        jtaf_group_file: "{{ jtaf_vars_root }}/group_vars/{{ item }}/all.yaml"
+      loop: "{{ group_names }}"
+      when: (query('ansible.builtin.fileglob', jtaf_group_file) | length) > 0
+
+    - name: Locate host vars file
+      set_fact:
+        jtaf_host_file: "{{ (query('ansible.builtin.fileglob', jtaf_vars_root + '/host_vars/' + inventory_hostname + '.y*ml') | sort | first) | default('', true) }}"
+
+    - name: Load host vars
+      set_fact:
+        jtaf_host_vars: "{{ lookup('file', jtaf_host_file) | from_yaml }}"
+      when: jtaf_host_file | length > 0
+
+  tasks:
+    - name: Render XML using generated role
+      ansible.builtin.include_role:
+        name: "[[ generated_role_name ]]"
+
+- name: Apply rendered XML via Juniper ansible-junos-stdlib
+  hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    tmp_dir: configs
+    ci_netconf_username: "{{ lookup('env', 'NETCONF_USERNAME') }}"
+    ci_netconf_password: "{{ lookup('env', 'NETCONF_PASSWORD') }}"
+    ci_expect_failure: "{{ (lookup('env', 'NETCONF_EXPECT_FAILURE') | default('0')) == '1' }}"
+  tasks:
+    - name: Push rendered XML via Juniper ansible-junos-stdlib
+      juniper.device.config:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(830) }}"
+        user: "{{ ci_netconf_username }}"
+        passwd: "{{ ci_netconf_password }}"
+        check: false
+        diff: false
+        commit: true
+        src: "{{ tmp_dir }}/{{ inventory_hostname }}.xml"
+        load: replace
+        comment: "CI apply generated role"
+      failed_when: false
+      register: junos_apply_result
+
+    - name: Fail with detailed module diagnostics
+      ansible.builtin.fail:
+        msg: |
+          juniper.device.config task failed for {{ inventory_hostname }}
+          expect_failure={{ ci_expect_failure }}
+          msg={{ junos_apply_result.msg | default('') }}
+          exception={{ junos_apply_result.exception | default('') }}
+          module_stdout={{ junos_apply_result.module_stdout | default('') }}
+          module_stderr={{ junos_apply_result.module_stderr | default('') }}
+      when: >-
+        (junos_apply_result.failed | default(false))
+        or ((junos_apply_result.msg | default('')) is search('ConnectAuthError|Unable to make a PyEZ connection|MODULE FAILURE|Traceback'))
+        or ((junos_apply_result.exception | default('')) is search('Traceback|Exception|Error'))
+        or ((junos_apply_result.module_stderr | default('')) is search('MODULE FAILURE|Traceback|Exception|Error'))
+        or (
+          ci_expect_failure
+          and not (
+            ((junos_apply_result.msg | default('')) is search('ConnectAuthError|Unable to make a PyEZ connection|MODULE FAILURE|Traceback'))
+            or ((junos_apply_result.exception | default('')) is search('Traceback|Exception|Error'))
+            or ((junos_apply_result.module_stderr | default('')) is search('MODULE FAILURE|Traceback|Exception|Error'))
+          )
+        )

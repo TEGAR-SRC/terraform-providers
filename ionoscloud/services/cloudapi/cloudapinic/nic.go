@@ -1,0 +1,390 @@
+package cloudapinic
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	cloudapiflowlog "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/flowlog"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/nsg"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+)
+
+type Service struct {
+	Client *ionoscloud.APIClient
+	Meta   any
+	D      *schema.ResourceData
+}
+
+func (fs *Service) List(ctx context.Context, datacenterID, serverID string, depth int32) ([]ionoscloud.Nic, error) {
+	emptyNicList := make([]ionoscloud.Nic, 0)
+	nics, apiResponse, err := fs.Client.NetworkInterfacesApi.DatacentersServersNicsGet(ctx, datacenterID, serverID).Depth(depth).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		return emptyNicList, err
+	}
+	if nics.Items == nil {
+		tflog.Debug(ctx, "empty nic list", map[string]any{"datacenter_id": datacenterID, "server_id": serverID})
+		return emptyNicList, nil
+	}
+	return *nics.Items, nil
+}
+
+func (fs *Service) Get(ctx context.Context, datacenterID, serverID, ID string, depth int32) (*ionoscloud.Nic, *ionoscloud.APIResponse, error) {
+	nic, apiResponse, err := fs.Client.NetworkInterfacesApi.DatacentersServersNicsFindById(ctx, datacenterID, serverID, ID).Depth(depth).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			tflog.Debug(ctx, "no nic found", map[string]any{"datacenter_id": datacenterID, "server_id": serverID})
+		}
+		return nil, apiResponse, err
+	}
+	return &nic, apiResponse, nil
+}
+
+func (fs *Service) Delete(ctx context.Context, datacenterID, serverID, ID string) (*ionoscloud.APIResponse, error) {
+	apiResponse, err := fs.Client.NetworkInterfacesApi.DatacentersServersNicsDelete(ctx, datacenterID, serverID, ID).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		return apiResponse, err
+	}
+	if errState := bundleclient.WaitForStateChange(ctx, fs.Meta, fs.D, apiResponse, schema.TimeoutDelete); errState != nil {
+		return apiResponse, fmt.Errorf("an error occurred while waiting for nic state change on delete dcID: %s, server_id: %s, ID: %s, Response: (%w)", datacenterID, serverID, ID, errState)
+	}
+	return apiResponse, nil
+}
+
+// Create - creates the resource in the backend and waits until it is in an `AVAILABLE` state
+func (fs *Service) Create(ctx context.Context, datacenterID, serverID string, nic ionoscloud.Nic) (*ionoscloud.Nic, *ionoscloud.APIResponse, error) {
+	val, apiResponse, err := fs.Client.NetworkInterfacesApi.DatacentersServersNicsPost(ctx, datacenterID, serverID).Nic(nic).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		return nil, apiResponse, fmt.Errorf("an error occurred while creating nic for dcID: %s, server_id: %s, Response: (%w)", datacenterID, serverID, err)
+	}
+	if errState := bundleclient.WaitForStateChange(ctx, fs.Meta, fs.D, apiResponse, schema.TimeoutCreate); errState != nil {
+		if bundleclient.IsRequestFailed(errState) {
+			fs.D.SetId("")
+		}
+		return nil, apiResponse, fmt.Errorf("an error occurred while waiting for nic state change on create dcID: %s, server_id: %s, Response: (%w)", datacenterID, serverID, errState)
+	}
+	return &val, apiResponse, nil
+}
+
+func (fs *Service) Update(ctx context.Context, datacenterID, serverID, ID string, nicProperties ionoscloud.NicProperties) (*ionoscloud.Nic, *ionoscloud.APIResponse, error) {
+	updatedNic, apiResponse, err := fs.Client.NetworkInterfacesApi.DatacentersServersNicsPatch(ctx, datacenterID, serverID, ID).Nic(nicProperties).Execute()
+	apiResponse.LogInfo()
+	if err != nil {
+		return nil, apiResponse, fmt.Errorf("an error occurred while updating nic for dcID: %s, server_id: %s, id %s, Response: (%w)", datacenterID, serverID, ID, err)
+	}
+	if errState := bundleclient.WaitForStateChange(ctx, fs.Meta, fs.D, apiResponse, schema.TimeoutUpdate); errState != nil {
+		return nil, apiResponse, fmt.Errorf("an error occurred while waiting for nic state change on update dcID: %s, server_id: %s, ID: %s, Response: (%w)", datacenterID, serverID, ID, errState)
+	}
+	return &updatedNic, apiResponse, nil
+}
+
+// DecodeTo - receives old and new values as slice of interfaces from schema, decodes and returns nic properties
+func DecodeTo(ctx context.Context, oldValues, newValues []any) ([]ionoscloud.Nic, []ionoscloud.Nic, error) {
+	oldNicProps := make([]ionoscloud.Nic, len(oldValues))
+	newNicProps := make([]ionoscloud.Nic, len(newValues))
+	err := utils.DecodeInterfaceToStruct(ctx, newValues, newNicProps)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not decode from %+v to new values of nic rules %w", newValues, err)
+	}
+	err = utils.DecodeInterfaceToStruct(ctx, oldValues, oldNicProps)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not decode from %+v to values of nic rules %w", oldValues, err)
+	}
+	return oldNicProps, newNicProps, nil
+}
+
+func SetNetworkProperties(nic ionoscloud.Nic) map[string]any {
+	network := map[string]any{}
+	if nic.Properties != nil {
+		utils.SetPropWithNilCheck(network, "dhcp", nic.Properties.Dhcp)
+		utils.SetPropWithNilCheck(network, "dhcpv6", nic.Properties.Dhcpv6)
+		utils.SetPropWithNilCheck(network, "firewall_active", nic.Properties.FirewallActive)
+		utils.SetPropWithNilCheck(network, "firewall_type", nic.Properties.FirewallType)
+		utils.SetPropWithNilCheck(network, "lan", nic.Properties.Lan)
+		utils.SetPropWithNilCheck(network, "name", nic.Properties.Name)
+		utils.SetPropWithNilCheck(network, "ips", nic.Properties.Ips)
+		utils.SetPropWithNilCheck(network, "ipv6_ips", nic.Properties.Ipv6Ips)
+		utils.SetPropWithNilCheck(network, "ipv6_cidr_block", nic.Properties.Ipv6CidrBlock)
+		utils.SetPropWithNilCheck(network, "mac", nic.Properties.Mac)
+		if nic.Properties.Ips != nil && len(*nic.Properties.Ips) > 0 {
+			network["ips"] = *nic.Properties.Ips
+		}
+	}
+	nsgIDs := make([]string, 0)
+	if nic.Entities != nil && nic.Entities.Securitygroups != nil && nic.Entities.Securitygroups.Items != nil {
+		for _, group := range *nic.Entities.Securitygroups.Items {
+			if group.Id != nil {
+				id := *group.Id
+				nsgIDs = append(nsgIDs, id)
+			}
+		}
+	}
+	utils.SetPropWithNilCheck(network, "security_groups_ids", nsgIDs)
+
+	return network
+}
+
+func GetNicFromSchema(d *schema.ResourceData, path string) (ionoscloud.Nic, error) {
+	nic := ionoscloud.Nic{
+		Properties: &ionoscloud.NicProperties{},
+	}
+
+	lanInt := int32(d.Get(path + "lan").(int))
+	nic.Properties.Lan = &lanInt
+
+	if v, ok := d.GetOk(path + "name"); ok {
+		vStr := v.(string)
+		nic.Properties.Name = &vStr
+	}
+
+	dhcp := d.Get(path + "dhcp").(bool)
+	if dhcpv6, ok := d.GetOkExists(path + "dhcpv6"); ok {
+		dhcpv6 := dhcpv6.(bool)
+		nic.Properties.Dhcpv6 = &dhcpv6
+	} else {
+		nic.Properties.SetDhcpv6Nil()
+	}
+
+	fwActive := d.Get(path + "firewall_active").(bool)
+	nic.Properties.Dhcp = &dhcp
+	nic.Properties.FirewallActive = &fwActive
+
+	if _, ok := d.GetOk(path + "firewall_type"); ok {
+		raw := d.Get(path + "firewall_type").(string)
+		nic.Properties.FirewallType = &raw
+	}
+
+	ips, err := GetNicIPsFromSchema(d, path+"ips")
+	if err != nil {
+		return nic, err
+	}
+	if ips != nil {
+		nic.Properties.Ips = &ips
+	}
+
+	ipv6IPs, err := GetNicIPsFromSchema(d, path+"ipv6_ips")
+	if err != nil {
+		return nic, err
+	}
+	if ipv6IPs != nil {
+		nic.Properties.Ipv6Ips = &ipv6IPs
+	}
+
+	if v, ok := d.GetOk(path + "ipv6_cidr_block"); ok {
+		ipv6Block := v.(string)
+		nic.Properties.Ipv6CidrBlock = &ipv6Block
+	}
+	if flowLogs, ok := d.GetOk("flowlog"); ok {
+		nic.Entities = &ionoscloud.NicEntities{
+			Flowlogs: &ionoscloud.FlowLogs{
+				Items: &[]ionoscloud.FlowLog{},
+			},
+		}
+		if flowLogList, ok := flowLogs.([]any); ok {
+			for _, flowLogData := range flowLogList {
+				if flowLog, ok := flowLogData.(map[string]any); ok {
+					*nic.Entities.Flowlogs.Items = append(*nic.Entities.Flowlogs.Items, cloudapiflowlog.GetFlowlogFromMap(flowLog))
+				}
+			}
+		}
+	}
+	return nic, nil
+}
+
+// GetNicFromSchemaCreate - creates a nic object for create operations from the schema
+func GetNicFromSchemaCreate(d *schema.ResourceData, path string) (ionoscloud.Nic, error) {
+	nic, err := GetNicFromSchema(d, path)
+	if err != nil {
+		return nic, err
+	}
+	if v, ok := d.GetOk(path + "mac"); ok {
+		vStr := v.(string)
+		nic.Properties.Mac = &vStr
+	}
+
+	return nic, nil
+}
+
+//nolint:gocyclo
+func NicSetData(ctx context.Context, d *schema.ResourceData, nic *ionoscloud.Nic) error {
+	if nic == nil {
+		return fmt.Errorf("nic is empty")
+	}
+
+	if nic.Id != nil {
+		d.SetId(*nic.Id)
+	}
+
+	if nic.Properties != nil {
+		tflog.Info(ctx, "LAN on NIC", map[string]any{"lan": nic.Properties.Lan})
+		if nic.Properties.Dhcp != nil {
+			if err := d.Set("dhcp", *nic.Properties.Dhcp); err != nil {
+				return fmt.Errorf("error setting dhcp %w", err)
+			}
+		}
+
+		if nic.Properties.Dhcpv6 != nil {
+			if err := d.Set("dhcpv6", *nic.Properties.Dhcpv6); err != nil {
+				return fmt.Errorf("error setting dhcpv6 %w", err)
+			}
+		}
+		if nic.Properties.Lan != nil {
+			if err := d.Set("lan", *nic.Properties.Lan); err != nil {
+				return fmt.Errorf("error setting lan %w", err)
+			}
+		}
+		if nic.Properties.Name != nil {
+			if err := d.Set("name", *nic.Properties.Name); err != nil {
+				return fmt.Errorf("error setting name %w", err)
+			}
+		}
+		if nic.Properties.Ips != nil && len(*nic.Properties.Ips) > 0 {
+			if err := d.Set("ips", *nic.Properties.Ips); err != nil {
+				return fmt.Errorf("error setting ips %w", err)
+			}
+		}
+		// should not be checked for len, we want to set the empty slice anyway as the field is computed, and it will not be set by backend
+		// if ipv6_cidr_block is not set on the lan
+		if nic.Properties.Ipv6Ips != nil {
+			if err := d.Set("ipv6_ips", *nic.Properties.Ipv6Ips); err != nil {
+				return fmt.Errorf("error setting ipv6_ips %w", err)
+			}
+		}
+		if nic.Properties.Ipv6CidrBlock != nil {
+			if err := d.Set("ipv6_cidr_block", *nic.Properties.Ipv6CidrBlock); err != nil {
+				return fmt.Errorf("error setting ipv6_cidr_block %w", err)
+			}
+		}
+		if nic.Properties.FirewallActive != nil {
+			if err := d.Set("firewall_active", *nic.Properties.FirewallActive); err != nil {
+				return fmt.Errorf("error setting firewall_active %w", err)
+			}
+		}
+		if nic.Properties.FirewallType != nil {
+			if err := d.Set("firewall_type", *nic.Properties.FirewallType); err != nil {
+				return fmt.Errorf("error setting firewall_type %w", err)
+			}
+		}
+		if nic.Properties.Mac != nil {
+			if err := d.Set("mac", *nic.Properties.Mac); err != nil {
+				return fmt.Errorf("error setting mac %w", err)
+			}
+		}
+		if nic.Properties.DeviceNumber != nil {
+			if err := d.Set("device_number", *nic.Properties.DeviceNumber); err != nil {
+				return fmt.Errorf("error setting device_number %w", err)
+			}
+		}
+		if nic.Properties.PciSlot != nil {
+			if err := d.Set("pci_slot", *nic.Properties.PciSlot); err != nil {
+				return fmt.Errorf("error setting pci_slot %w", err)
+			}
+		}
+		if nic.Entities != nil && nic.Entities.Securitygroups != nil && nic.Entities.Securitygroups.Items != nil {
+			if err := nsg.SetNSGInResourceData(d, nic.Entities.Securitygroups.Items); err != nil {
+				return err
+			}
+		}
+	}
+
+	if nic.Entities != nil && nic.Entities.Flowlogs != nil && nic.Entities.Flowlogs.Items != nil && len(*nic.Entities.Flowlogs.Items) > 0 {
+		var flowlogs []map[string]any
+		for _, flowLog := range *nic.Entities.Flowlogs.Items {
+			result := map[string]any{}
+			result, err := utils.DecodeStructToMap(flowLog.Properties)
+			if err != nil {
+				return err
+			}
+			result["id"] = *flowLog.Id
+			flowlogs = append(flowlogs, result)
+		}
+		if err := d.Set("flowlog", flowlogs); err != nil {
+			return fmt.Errorf("error setting flowlog %w", err)
+		}
+	}
+
+	return nil
+}
+
+// GetNicIPsFromSchema receives the resource data and an attribute that specifies how to access the IPs (to differentiate
+// between the inline NICs and the independent NIC resource) and returns the IPs or IPv6IPs for a specific NIC and any
+// error that may occur while reading the configuration.
+// Information about the IPs is obtained using the raw configuration. The difference between reading the raw config
+// and using d.GetOk() function is that d.GetOk() function ignores the case in which the user explicitly sets an empty
+// list of IPs in the plan: 'ips = []' in the TF plan => d.GetOk('ips') will return: _, false.
+func GetNicIPsFromSchema(d *schema.ResourceData, attr string) ([]string, error) {
+	mainError := errors.New("error when reading the raw NIC IPs configuration")
+	allowedAttrs := map[string]struct{}{
+		"ips":            {},
+		"ipv6_ips":       {},
+		"nic.0.ips":      {},
+		"nic.0.ipv6_ips": {},
+	}
+	if _, ok := allowedAttrs[attr]; !ok {
+		return nil, fmt.Errorf("%w provided attribute is not supported: %s", mainError, attr)
+	}
+
+	rawConfig := d.GetRawConfig()
+	if rawConfig.IsNull() {
+		return nil, fmt.Errorf("%w expected a valid configuration but received null instead", mainError)
+	}
+
+	parts := strings.Split(attr, ".")
+	partsLen := len(parts)
+	var rawIPs cty.Value
+
+	// Extract the raw IPs from the configuration.
+	// In the future, if multiple inline NICs will be allowed, the functionality needs to be extended in order to
+	// support more attributes: 'nic.1.ips', 'nic.2.ips', 'nic.i.ips', etc.
+	// 'ips' or 'ipv6_ips'
+	switch partsLen {
+	// 'ips', 'ipv6_ips'
+	case 1:
+		rawIPs = rawConfig.GetAttr(attr)
+	// 'nic.0.ips' or 'nic.0.ipv6_ips'
+	case 3:
+		rawNICsList := rawConfig.GetAttr(parts[0])
+		if rawNICsList.IsNull() {
+			return nil, fmt.Errorf("%w expected a valid list of inline NICs configuration but received null instead", mainError)
+		}
+		if rawNICsList.LengthInt() == 0 {
+			return nil, fmt.Errorf("%w expected at least one inline NIC in the configuration but received 0 instead", mainError)
+		}
+		rawNIC := rawNICsList.Index(cty.NumberIntVal(0))
+		if rawNIC.IsNull() {
+			return nil, fmt.Errorf("%w expected a valid NIC configuration but received null instead", mainError)
+		}
+		rawIPs = rawNIC.GetAttr(parts[2])
+	default:
+		return nil, fmt.Errorf("%w provided attribute is not supported", mainError)
+	}
+
+	// if attribute is specified in the tf plan, doesn't matter if it's an empty or a non-empty list
+	if !rawIPs.IsNull() {
+		rawSetOfIPs, ok := d.Get(attr).(*schema.Set)
+		if !ok {
+			return nil, fmt.Errorf("%w failed type assertion for NIC IPs, expected type: *schema.Set, actual type: %T", mainError, rawSetOfIPs)
+		}
+		ips := make([]string, 0, rawSetOfIPs.Len())
+		for _, rawIP := range rawSetOfIPs.List() {
+			ip, ok := rawIP.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w failed type assertion for NIC IP, expected type: string, actual type: %T", mainError, rawIP)
+			}
+			ips = append(ips, ip)
+		}
+		return ips, nil
+	}
+	return nil, nil
+}

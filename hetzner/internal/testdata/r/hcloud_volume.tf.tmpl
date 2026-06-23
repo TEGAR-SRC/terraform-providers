@@ -1,0 +1,21 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_volume" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  name               = "{{ .Name }}--{{ .RInt }}"
+  size               =  {{ .Size }}
+  {{- if .LocationName }}
+  location           =  "{{ .LocationName }}"
+  {{ end }}
+  {{- if .ServerID }}
+  server_id          =  {{ .ServerID }}
+  {{ end }}
+
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+
+  {{- if .DeleteProtection }}
+  delete_protection = {{ .DeleteProtection }}
+  {{ end }}
+}

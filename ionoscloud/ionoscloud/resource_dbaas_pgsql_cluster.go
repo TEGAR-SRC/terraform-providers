@@ -1,0 +1,410 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	dbaasservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/dbaas"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+)
+
+func resourceDbaasPgSqlCluster() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceDbaasPgSqlClusterCreate,
+		ReadContext:   resourceDbaasPgSqlClusterRead,
+		UpdateContext: resourceDbaasPgSqlClusterUpdate,
+		DeleteContext: resourceDbaasPgSqlClusterDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceDbaasPgSqlClusterImport,
+		},
+		CustomizeDiff: checkDBaaSClusterImmutableFields,
+		Schema: map[string]*schema.Schema{
+			"postgres_version": {
+				Type:             schema.TypeString,
+				Description:      "The PostgreSQL version of your cluster.",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"instances": {
+				Type:             schema.TypeInt,
+				Description:      "The total number of instances in the cluster (one master and n-1 standbys)",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IntBetween(1, 5)),
+			},
+			"cores": {
+				Type:        schema.TypeInt,
+				Description: "The number of CPU cores per replica.",
+				Required:    true,
+			},
+			"ram": {
+				Type:             schema.TypeInt,
+				Description:      "The amount of memory per instance in megabytes. Has to be a multiple of 1024.",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.All(validation.IntAtLeast(2048), validation.IntDivisibleBy(1024))),
+			},
+			"storage_size": {
+				Type:             schema.TypeInt,
+				Description:      "The amount of storage per instance in megabytes. Has to be a multiple of 2048.",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(2048)),
+			},
+			"storage_type": {
+				Type:             schema.TypeString,
+				Description:      "The storage type used in your cluster.",
+				Required:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringInSlice([]string{"HDD", "SSD", "SSD Premium", "SSD Standard"}, true)),
+			},
+			"connection_pooler": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Description: "Configuration options for the connection pooler",
+				Optional:    true,
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"enabled": {
+							Type:     schema.TypeBool,
+							Required: true,
+						},
+						"pool_mode": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "Represents different modes of connection pooling for the connection pooler",
+						},
+					},
+				},
+			},
+			"connections": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Description: "Details about the network connection for your cluster.",
+				Optional:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"datacenter_id": {
+							Type:             schema.TypeString,
+							Description:      "The datacenter to connect your cluster to.",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+						},
+						"lan_id": {
+							Type:             schema.TypeString,
+							Description:      "The LAN to connect your cluster to.",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+						"cidr": {
+							Type:             schema.TypeString,
+							Description:      "The IP and subnet for the database.\n          Note the following unavailable IP ranges:\n          10.233.64.0/18\n          10.233.0.0/18\n          10.233.114.0/24",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(VerifyUnavailableIPs),
+						},
+					},
+				},
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The physical location where the cluster will be created. This will be where all of your instances live. Property cannot be modified after datacenter creation (disallowed in update requests)",
+				Required:    true,
+				ForceNew:    true,
+				// There is a small API bug: if the cluster is created in 'de/fra/2', on GET
+				// requests the location will be shown as 'de/fra' and this generates a drift.
+				// This is a workaround until the API bug (DB-4824) is solved.
+				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+					if old == "de/fra" && new == "de/fra/2" {
+						return true
+					}
+					return false
+				},
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"allow_replace": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "When set to true, allows the update of immutable fields by destroying and re-creating the cluster.",
+			},
+			"backup_location": {
+				Type:        schema.TypeString,
+				Description: "The Object Storage location where the backups will be stored.",
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+			},
+			"display_name": {
+				Type:        schema.TypeString,
+				Description: "The friendly name of your cluster.",
+				Required:    true,
+			},
+			"maintenance_window": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Description: "a weekly 4 hour-long window, during which maintenance might occur",
+				Optional:    true,
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"time": {
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+						"day_of_the_week": {
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IsDayOfTheWeek(true)),
+						},
+					},
+				},
+			},
+			"credentials": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Description: "Credentials for the database user to be created.",
+				Required:    true,
+				ForceNew:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"username": {
+							Type:             schema.TypeString,
+							Description:      "the username for the initial postgres user. some system usernames are restricted (e.g. \"postgres\", \"admin\", \"standby\")",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+						"password": {
+							Type:             schema.TypeString,
+							Required:         true,
+							Sensitive:        true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+					},
+				},
+			},
+			"synchronization_mode": {
+				Type:        schema.TypeString,
+				Description: "Represents different modes of replication.",
+				Required:    true,
+			},
+			"from_backup": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Description: "Creates the cluster based on the existing backup.",
+				Optional:    true,
+				ForceNew:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"backup_id": {
+							Type:             schema.TypeString,
+							Description:      "The unique ID of the backup you want to restore.",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+						"recovery_target_time": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "If this value is supplied as ISO 8601 timestamp, the backup will be replayed up until the given timestamp. If empty, the backup will be applied completely.",
+						},
+					},
+				},
+			},
+			"dns_name": {
+				Type:        schema.TypeString,
+				Description: "The DNS name pointing to your cluster",
+				Computed:    true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+func checkDBaaSClusterImmutableFields(_ context.Context, diff *schema.ResourceDiff, _ any) error {
+
+	allowReplace := diff.Get("allow_replace").(bool)
+	if allowReplace {
+		return nil
+	}
+	// we do not want to check in case of resource creation
+	if diff.Id() == "" {
+		return nil
+	}
+	if diff.HasChange("storage_type") {
+		return fmt.Errorf("storage_type %s", ImmutableError)
+	}
+	if diff.HasChange("location") {
+		// There is a small API bug: if the cluster is created in 'de/fra/2', on GET
+		// requests the location will be shown as 'de/fra' and this generates a drift.
+		// This is a workaround until the API bug (DB-4824) is solved.
+		oldValueIntf, newValueIntf := diff.GetChange("location")
+		oldValueStr := oldValueIntf.(string)
+		newValueStr := newValueIntf.(string)
+		if oldValueStr == "de/fra" && newValueStr == "de/fra/2" {
+			return nil
+		}
+		return fmt.Errorf("location %s", ImmutableError)
+	}
+	if diff.HasChange("backup_location") {
+		return fmt.Errorf("backup_location %s", ImmutableError)
+	}
+	if diff.HasChange("credentials") {
+		return fmt.Errorf("credentials %s", ImmutableError)
+	}
+	if diff.HasChange("from_backup") {
+		return fmt.Errorf("from_backup %s", ImmutableError)
+	}
+	return nil
+
+}
+
+func resourceDbaasPgSqlClusterCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dbaasCluster, err := dbaasservice.GetPgSqlClusterDataCreate(d)
+
+	if err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	dbaasClusterResponse, apiResponse, err := client.CreateCluster(ctx, *dbaasCluster)
+
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while creating a DBaaS psql cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	d.SetId(*dbaasClusterResponse.Id)
+
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsClusterReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("creating psql %w ", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String()})
+	}
+
+	return resourceDbaasPgSqlClusterRead(ctx, d, meta)
+}
+
+func resourceDbaasPgSqlClusterRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	cluster, apiResponse, err := client.GetCluster(ctx, d.Id())
+
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("error while fetching dbaas cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	tflog.Info(ctx, "retrieved PgSQL cluster", map[string]any{"cluster_id": d.Id()})
+
+	if err := dbaasservice.SetPgSqlClusterData(d, cluster, false); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
+
+func resourceDbaasPgSqlClusterUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	cluster, diags := dbaasservice.GetPgSqlClusterDataUpdate(d)
+	if diags != nil {
+		return diags
+	}
+
+	dbaasClusterResponse, apiResponse, err := client.UpdateCluster(ctx, d.Id(), *cluster)
+
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while updating a dbaas cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	d.SetId(*dbaasClusterResponse.Id)
+
+	time.Sleep(constant.SleepInterval)
+
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsClusterReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("creating psql %w ", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String()})
+	}
+
+	return resourceDbaasPgSqlClusterRead(ctx, d, meta)
+}
+
+func resourceDbaasPgSqlClusterDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	_, apiResponse, err := client.DeleteCluster(ctx, d.Id())
+
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("error while deleting dbaas cluster: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	err = utils.WaitForResourceToBeDeleted(ctx, d, client.IsClusterDeleted)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("the check for cluster deletion failed with the following error: %w", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String()})
+	}
+
+	// wait 15 seconds after the deletion of the cluster, for the lan to be freed
+	time.Sleep(constant.SleepInterval * 3)
+
+	return nil
+}
+
+func resourceDbaasPgSqlClusterImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	importID := d.Id()
+	location, parts := splitImportID(importID, "/")
+	if len(parts) != 1 {
+		return nil, fmt.Errorf("invalid import identifier: expected one of <location>:<cluster-id> or <cluster-id>, got: %s", importID)
+	}
+
+	if err := validateImportIDParts(parts); err != nil {
+		return nil, fmt.Errorf("failed validating import identifier %q: %w", importID, err)
+	}
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+
+	clusterID := parts[0]
+
+	dbaasCluster, apiResponse, err := client.GetCluster(ctx, clusterID)
+
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("dbaas cluster does not exist %q", clusterID), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("an error occurred while trying to fetch the import of dbaas cluster %q, error:%w", clusterID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	tflog.Info(ctx, "PgSQL cluster imported", map[string]any{"cluster_id": clusterID})
+
+	if err := dbaasservice.SetPgSqlClusterData(d, dbaasCluster, false); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+
+	return []*schema.ResourceData{d}, nil
+}

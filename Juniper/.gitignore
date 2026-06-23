@@ -1,0 +1,16 @@
+/venv/
+/config.toml
+/Samples/
+/dev_files/
+/testbed/
+/testing_folder/
+/yang/
+/.idea/
+/build/
+/junosterraform.egg-info/
+/testbed/
+__pycache__/
+/dist/
+/terraform-provider-junos-vqfx-evpn-vxlan/
+/.venv/
+.DS_Store

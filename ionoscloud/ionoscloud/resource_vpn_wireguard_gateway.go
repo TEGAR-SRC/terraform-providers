@@ -1,0 +1,230 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/vpn"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func resourceVpnWireguardGateway() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceVpnWireguardGatewayCreate,
+		ReadContext:   resourceVpnWireguardGatewayRead,
+		UpdateContext: resourceVpnWireguardGatewayUpdate,
+		DeleteContext: resourceVpnWireguardGatewayDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceVpnWireguardGatewayImport,
+		},
+
+		Schema: map[string]*schema.Schema{
+			"name": {
+				Type:     schema.TypeString,
+				Required: true,
+			},
+			"gateway_ip": {
+				Type:     schema.TypeString,
+				Required: true,
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: fmt.Sprintf("The location of the WireGuard Gateway. Supported locations: %s", strings.Join(vpn.AvailableLocations, ", ")),
+				Optional:    true,
+				ForceNew:    true,
+			},
+			"connections": {
+				MinItems: 1,
+				Type:     schema.TypeList,
+				Required: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"datacenter_id": {
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+						},
+						"lan_id": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"ipv4_cidr": {
+							Type:             schema.TypeString,
+							Description:      "A LAN IPv4 address in CIDR notation that will be assigned to the VPN Gateway. This will be the private gateway address for LAN clients to route traffic over the VPN Gateway, this should be within the subnet already assigned to the LAN.",
+							ValidateDiagFunc: validation.ToDiagFunc(validation.IsCIDR),
+							Optional:         true,
+						},
+						"ipv6_cidr": {
+							Type:        schema.TypeString,
+							Description: "A LAN IPv6 address in CIDR notation that will be assigned to the VPN Gateway. This will be the private gateway address for LAN clients to route traffic over the VPN Gateway, this should be within the subnet already assigned to the LAN.",
+							Optional:    true,
+						},
+					},
+				},
+			},
+			"private_key": {
+				Type:             schema.TypeString,
+				Required:         true,
+				Description:      "PrivateKey used for WireGuard Server",
+				Sensitive:        true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"public_key": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "PublicKey used for WireGuard Server. Received in response from API",
+			},
+			"description": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"interface_ipv4_cidr": {
+				Type: schema.TypeString,
+				Description: `The IPV4 address (with CIDR mask) to be assigned to the WireGuard interface. 
+							 __Note__: either interfaceIPv4CIDR or interfaceIPv6CIDR is __required__.`,
+				Optional:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsCIDR),
+			},
+			"interface_ipv6_cidr": {
+				Type: schema.TypeString,
+				Description: `The IPV6 address (with CIDR mask) to be assigned to the WireGuard interface.
+							 __Note__: either interfaceIPv6CIDR or interfaceIPv4CIDR is __required__.`,
+				Optional:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsCIDR),
+			},
+			"listen_port": {
+				Type:     schema.TypeInt,
+				Default:  51820,
+				Optional: true,
+			},
+			"status": {
+				Type:        schema.TypeString,
+				Description: "The status of the WireGuard Gateway",
+				Computed:    true,
+			},
+			"maintenance_window": {
+				Type:        schema.TypeList,
+				Description: "A weekly 4 hour-long window, during which maintenance might occur",
+				Optional:    true,
+				Computed:    true,
+				MaxItems:    1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"time": {
+							Type:        schema.TypeString,
+							Description: "Start of the maintenance window in UTC time.",
+							Required:    true,
+						},
+						"day_of_the_week": {
+							Type:        schema.TypeString,
+							Description: "The name of the week day",
+							Required:    true,
+						},
+					},
+				},
+			},
+			"tier": {
+				Type:        schema.TypeString,
+				Description: "Gateway performance options. See the documentation for the available options",
+				Default:     constant.DefaultTier,
+				Optional:    true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func resourceVpnWireguardGatewayCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).VPNClient
+
+	gateway, apiResponse, err := client.CreateWireguardGateway(ctx, d)
+	if err != nil {
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	d.SetId(gateway.Id)
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsWireguardGatewayReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("creating %w ", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String()})
+	}
+	return resourceVpnWireguardGatewayRead(ctx, d, meta)
+}
+
+func resourceVpnWireguardGatewayRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).VPNClient
+	location := d.Get("location").(string)
+	wireguard, apiResponse, err := client.GetWireguardGatewayByID(ctx, d.Id(), location)
+	if err != nil {
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	return diagutil.ToDiags(d, vpn.SetWireguardGWData(d, wireguard), nil)
+}
+func resourceVpnWireguardGatewayUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).VPNClient
+
+	wireguard, apiResponse, err := client.UpdateWireguardGateway(ctx, d.Id(), d)
+	if err != nil {
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	err = utils.WaitForResourceToBeReady(ctx, d, client.IsWireguardGatewayReady)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("creating %w ", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String()})
+	}
+
+	return diagutil.ToDiags(d, vpn.SetWireguardGWData(d, wireguard), nil)
+}
+
+func resourceVpnWireguardGatewayDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).VPNClient
+	location := d.Get("location").(string)
+	apiResponse, err := client.DeleteWireguardGateway(ctx, d.Id(), location)
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("error while deleting WireGuard Gateway: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	//todo: for now we need to keep this because otherwise we get an internal server error on the first find after the delete
+	// remove when no longer necessary
+	time.Sleep(5 * time.Second)
+	err = utils.WaitForResourceToBeDeleted(ctx, d, client.IsWireguardGatewayDeleted)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("while waiting for the WireGuard Gateway to be deleted: %w", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String()})
+	}
+
+	tflog.Info(ctx, "successfully deleted Wireguard Gateway", map[string]any{"gateway_id": d.Id()})
+	d.SetId("")
+
+	return nil
+}
+
+func resourceVpnWireguardGatewayImport(ctx context.Context, d *schema.ResourceData, m any) ([]*schema.ResourceData, error) {
+	client := m.(bundleclient.SdkBundle).VPNClient
+	parts := strings.Split(d.Id(), ":")
+	if len(parts) != 2 {
+		return nil, diagutil.ToError(d, fmt.Errorf("invalid import format:, expecting the following format: location:id"), nil)
+	}
+	location := parts[0]
+	ID := parts[1]
+	gateway, apiResponse, err := client.GetWireguardGatewayByID(ctx, ID, location)
+	if err != nil {
+		return nil, diagutil.ToError(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	if err := d.Set("location", location); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	if err := vpn.SetWireguardGWData(d, gateway); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	return []*schema.ResourceData{d}, nil
+}

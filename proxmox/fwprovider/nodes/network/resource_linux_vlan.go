@@ -1,0 +1,508 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package network
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/migration"
+	customtypes "github.com/bpg/terraform-provider-proxmox/fwprovider/types"
+	"github.com/bpg/terraform-provider-proxmox/proxmox"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes"
+	proxmoxtypes "github.com/bpg/terraform-provider-proxmox/proxmox/types"
+)
+
+var (
+	_ resource.Resource                = &linuxVLANResource{}
+	_ resource.ResourceWithConfigure   = &linuxVLANResource{}
+	_ resource.ResourceWithImportState = &linuxVLANResource{}
+)
+
+type linuxVLANResourceModel struct {
+	// Base attributes
+	ID        types.String            `tfsdk:"id"`
+	NodeName  types.String            `tfsdk:"node_name"`
+	Name      types.String            `tfsdk:"name"`
+	Address   customtypes.IPCIDRValue `tfsdk:"address"`
+	Gateway   customtypes.IPAddrValue `tfsdk:"gateway"`
+	Address6  customtypes.IPCIDRValue `tfsdk:"address6"`
+	Gateway6  customtypes.IPAddrValue `tfsdk:"gateway6"`
+	Autostart types.Bool              `tfsdk:"autostart"`
+	MTU       types.Int64             `tfsdk:"mtu"`
+	Comment   types.String            `tfsdk:"comment"`
+	Timeout   types.Int64             `tfsdk:"timeout_reload"`
+	// Linux VLAN attributes
+	Interface types.String `tfsdk:"interface"`
+	VLAN      types.Int64  `tfsdk:"vlan"`
+}
+
+func (m *linuxVLANResourceModel) exportToNetworkInterfaceCreateUpdateBody() *nodes.NetworkInterfaceCreateUpdateRequestBody {
+	body := &nodes.NetworkInterfaceCreateUpdateRequestBody{
+		Iface:     m.Name.ValueString(),
+		Type:      "vlan",
+		Autostart: proxmoxtypes.CustomBool(m.Autostart.ValueBool()).Pointer(),
+	}
+
+	body.CIDR = m.Address.ValueStringPointer()
+	body.Gateway = m.Gateway.ValueStringPointer()
+	body.CIDR6 = m.Address6.ValueStringPointer()
+	body.Gateway6 = m.Gateway6.ValueStringPointer()
+	body.Comments = attribute.StringPtrFromValue(m.Comment)
+
+	body.MTU = attribute.Int64PtrFromValue(m.MTU)
+	body.VLANRawDevice = attribute.StringPtrFromValue(m.Interface)
+	body.VLANID = attribute.Int64PtrFromValue(m.VLAN)
+
+	return body
+}
+
+func (m *linuxVLANResourceModel) importFromNetworkInterfaceList(iface *nodes.NetworkInterfaceListResponseData) {
+	m.Address = customtypes.NewIPCIDRPointerValue(iface.CIDR)
+	m.Gateway = customtypes.NewIPAddrPointerValue(iface.Gateway)
+	m.Address6 = customtypes.NewIPCIDRPointerValue(iface.CIDR6)
+	m.Gateway6 = customtypes.NewIPAddrPointerValue(iface.Gateway6)
+	m.Autostart = types.BoolPointerValue(iface.Autostart.PointerBool())
+
+	if iface.MTU != nil {
+		if v, err := strconv.Atoi(*iface.MTU); err == nil {
+			m.MTU = types.Int64Value(int64(v))
+		}
+	} else {
+		m.MTU = types.Int64Null()
+	}
+
+	if iface.Comments != nil {
+		m.Comment = types.StringValue(strings.TrimSpace(*iface.Comments))
+	} else {
+		m.Comment = types.StringNull()
+	}
+
+	if iface.VLANID != nil {
+		if v, err := strconv.Atoi(*iface.VLANID); err == nil {
+			m.VLAN = types.Int64Value(int64(v))
+		}
+	} else {
+		// in reality, this should never happen
+		m.VLAN = types.Int64Unknown()
+	}
+
+	if iface.VLANRawDevice != nil {
+		m.Interface = types.StringValue(strings.TrimSpace(*iface.VLANRawDevice))
+	} else {
+		m.Interface = types.StringNull()
+	}
+}
+
+// NewLinuxVLANResource creates a new resource for managing Linux VLAN network interfaces.
+func NewLinuxVLANResource() resource.Resource {
+	return &linuxVLANResource{}
+}
+
+type linuxVLANResource struct {
+	client proxmox.Client
+}
+
+func (r *linuxVLANResource) Metadata(
+	_ context.Context,
+	req resource.MetadataRequest,
+	resp *resource.MetadataResponse,
+) {
+	resp.TypeName = req.ProviderTypeName + "_network_linux_vlan"
+}
+
+// Schema defines the schema for the resource.
+func (r *linuxVLANResource) Schema(
+	_ context.Context,
+	_ resource.SchemaRequest,
+	resp *resource.SchemaResponse,
+) {
+	resp.Schema = schema.Schema{
+		DeprecationMessage: migration.DeprecationMessage("proxmox_network_linux_vlan"),
+		Description:        "Manages a Linux VLAN network interface in a Proxmox VE node.",
+		Attributes: map[string]schema.Attribute{
+			// Base attributes
+			"id": attribute.ResourceID("A unique identifier with format `<node name>:<iface>`."),
+			"node_name": schema.StringAttribute{
+				Description: "The name of the node.",
+				Required:    true,
+			},
+			"name": schema.StringAttribute{
+				Description: "The interface name.",
+				MarkdownDescription: "The interface name. Either add the VLAN tag number to an existing interface name, " +
+					"e.g. `ens18.21` (and do not set `interface` and `vlan`), or use custom name, e.g. `vlan_lab` " +
+					"(`interface` and `vlan` are then required).",
+				Required: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(3),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"address": schema.StringAttribute{
+				Description: "The interface IPv4/CIDR address.",
+				CustomType:  customtypes.IPCIDRType{},
+				Optional:    true,
+			},
+			"gateway": schema.StringAttribute{
+				Description: "Default gateway address.",
+				CustomType:  customtypes.IPAddrType{},
+				Optional:    true,
+			},
+			"address6": schema.StringAttribute{
+				Description: "The interface IPv6/CIDR address.",
+				CustomType:  customtypes.IPCIDRType{},
+				Optional:    true,
+			},
+			"gateway6": schema.StringAttribute{
+				Description: "Default IPv6 gateway address.",
+				CustomType:  customtypes.IPAddrType{},
+				Optional:    true,
+			},
+			"autostart": schema.BoolAttribute{
+				Description: "Automatically start interface on boot (defaults to `true`).",
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(true),
+			},
+			"mtu": schema.Int64Attribute{
+				Description: "The interface MTU.",
+				Optional:    true,
+			},
+			"comment": schema.StringAttribute{
+				Description: "Comment for the interface.",
+				Optional:    true,
+			},
+			"timeout_reload": schema.Int64Attribute{
+				Description: "Timeout for network reload operations in seconds (defaults to `100`).",
+				Optional:    true,
+				Computed:    true,
+				Default:     int64default.StaticInt64(int64(nodes.NetworkReloadTimeout.Seconds())),
+				Validators: []validator.Int64{
+					int64validator.AtLeast(5),
+				},
+			},
+			// Linux VLAN attributes
+			"interface": schema.StringAttribute{
+				Description: "The VLAN raw device. See also `name`.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"vlan": schema.Int64Attribute{
+				Description: "The VLAN tag. See also `name`.",
+				Optional:    true,
+				Computed:    true,
+				// 4,094
+			},
+		},
+	}
+}
+
+func (r *linuxVLANResource) Configure(
+	_ context.Context,
+	req resource.ConfigureRequest,
+	resp *resource.ConfigureResponse,
+) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.Resource)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected config.Resource, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	r.client = cfg.Client
+}
+
+func (r *linuxVLANResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan linuxVLANResourceModel
+
+	diags := req.Plan.Get(ctx, &plan)
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	body := plan.exportToNetworkInterfaceCreateUpdateBody()
+
+	err := r.client.Node(plan.NodeName.ValueString()).CreateNetworkInterface(ctx, body)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error creating Linux VLAN interface",
+			"Could not create Linux VLAN, unexpected error: "+err.Error(),
+		)
+
+		return
+	}
+
+	plan.ID = types.StringValue(plan.NodeName.ValueString() + ":" + plan.Name.ValueString())
+
+	found := r.read(ctx, &plan, &resp.Diagnostics)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !found {
+		resp.Diagnostics.AddError(
+			"Linux VLAN interface not found after creation",
+			fmt.Sprintf(
+				"Interface %q on node %q could not be read after creation",
+				plan.Name.ValueString(), plan.NodeName.ValueString()),
+		)
+
+		return
+	}
+
+	resp.State.Set(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+
+	reloadCtx, cancel := context.WithTimeout(ctx, time.Duration(plan.Timeout.ValueInt64())*time.Second)
+	defer cancel()
+
+	err = r.client.Node(plan.NodeName.ValueString()).ReloadNetworkConfiguration(reloadCtx)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reloading network configuration",
+			fmt.Sprintf("Could not reload network configuration on node '%s', unexpected error: %s",
+				plan.NodeName.ValueString(), err.Error()),
+		)
+	}
+}
+
+func (r *linuxVLANResource) read(ctx context.Context, model *linuxVLANResourceModel, diags *diag.Diagnostics) bool {
+	ifaces, err := r.client.Node(model.NodeName.ValueString()).ListNetworkInterfaces(ctx)
+	if err != nil {
+		diags.AddError(
+			"Error listing network interfaces",
+			"Could not list network interfaces, unexpected error: "+err.Error(),
+		)
+
+		return false
+	}
+
+	for _, iface := range ifaces {
+		if iface.Iface != model.Name.ValueString() {
+			continue
+		}
+
+		model.importFromNetworkInterfaceList(iface)
+
+		return true
+	}
+
+	return false
+}
+
+// Read reads a Linux VLAN interface.
+func (r *linuxVLANResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	// Get current state
+	var state linuxVLANResourceModel
+
+	diags := req.State.Get(ctx, &state)
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	found := r.read(ctx, &state, &resp.Diagnostics)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !found {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	diags = resp.State.Set(ctx, state)
+	resp.Diagnostics.Append(diags...)
+}
+
+// Update updates a Linux VLAN interface.
+func (r *linuxVLANResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state linuxVLANResourceModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	body := plan.exportToNetworkInterfaceCreateUpdateBody()
+
+	var toDelete []string
+
+	attribute.CheckDelete(plan.Address, state.Address, &toDelete, "cidr")
+	attribute.CheckDelete(plan.Address6, state.Address6, &toDelete, "cidr6")
+	attribute.CheckDelete(plan.MTU, state.MTU, &toDelete, "mtu")
+	attribute.CheckDelete(plan.Gateway, state.Gateway, &toDelete, "gateway")
+	attribute.CheckDelete(plan.Gateway6, state.Gateway6, &toDelete, "gateway6")
+	attribute.CheckDelete(plan.Comment, state.Comment, &toDelete, "comments")
+
+	if len(toDelete) > 0 {
+		body.Delete = toDelete
+	}
+
+	err := r.client.Node(plan.NodeName.ValueString()).UpdateNetworkInterface(ctx, plan.Name.ValueString(), body)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error updating Linux VLAN interface",
+			"Could not update Linux VLAN, unexpected error: "+err.Error(),
+		)
+
+		return
+	}
+
+	found := r.read(ctx, &plan, &resp.Diagnostics)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !found {
+		resp.Diagnostics.AddError(
+			"Linux VLAN interface not found after update",
+			fmt.Sprintf(
+				"Interface %q on node %q could not be read after update",
+				plan.Name.ValueString(), plan.NodeName.ValueString()),
+		)
+
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+
+	reloadCtx, cancel := context.WithTimeout(ctx, time.Duration(plan.Timeout.ValueInt64())*time.Second)
+	defer cancel()
+
+	err = r.client.Node(plan.NodeName.ValueString()).ReloadNetworkConfiguration(reloadCtx)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reloading network configuration",
+			fmt.Sprintf("Could not reload network configuration on node '%s', unexpected error: %s",
+				plan.NodeName.ValueString(), err.Error()),
+		)
+	}
+}
+
+// Delete deletes a Linux VLAN interface.
+//
+
+func (r *linuxVLANResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var state linuxVLANResourceModel
+
+	diags := req.State.Get(ctx, &state)
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	err := r.client.Node(state.NodeName.ValueString()).DeleteNetworkInterface(ctx, state.Name.ValueString())
+	if err != nil {
+		if strings.Contains(err.Error(), "interface does not exist") {
+			resp.Diagnostics.AddWarning(
+				"Linux VLAN interface does not exist",
+				fmt.Sprintf("Could not delete Linux VLAN '%s', interface does not exist, "+
+					"or has already been deleted outside of Terraform.", state.Name.ValueString()),
+			)
+		} else {
+			resp.Diagnostics.AddError(
+				"Error deleting Linux VLAN interface",
+				fmt.Sprintf("Could not delete Linux VLAN '%s', unexpected error: %s",
+					state.Name.ValueString(), err.Error()),
+			)
+		}
+
+		return
+	}
+
+	reloadCtx, cancel := context.WithTimeout(ctx, time.Duration(state.Timeout.ValueInt64())*time.Second)
+	defer cancel()
+
+	err = r.client.Node(state.NodeName.ValueString()).ReloadNetworkConfiguration(reloadCtx)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reloading network configuration",
+			fmt.Sprintf("Could not reload network configuration on node '%s', unexpected error: %s",
+				state.NodeName.ValueString(), err.Error()),
+		)
+	}
+}
+
+//nolint:dupl // ImportState mirrors linux_bond and linux_bridge but is bound to a distinct resource type
+func (r *linuxVLANResource) ImportState(
+	ctx context.Context,
+	req resource.ImportStateRequest,
+	resp *resource.ImportStateResponse,
+) {
+	idParts := strings.Split(req.ID, ":")
+	if len(idParts) != 2 || idParts[0] == "" || idParts[1] == "" {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			fmt.Sprintf("Expected import identifier with format: node_name:iface. Got: %q", req.ID),
+		)
+
+		return
+	}
+
+	nodeName := idParts[0]
+	iface := idParts[1]
+
+	state := linuxVLANResourceModel{
+		ID:       types.StringValue(req.ID),
+		NodeName: types.StringValue(nodeName),
+		Name:     types.StringValue(iface),
+		Timeout:  types.Int64Value(int64(nodes.NetworkReloadTimeout.Seconds())),
+	}
+	found := r.read(ctx, &state, &resp.Diagnostics)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !found {
+		resp.Diagnostics.AddError(
+			"Linux VLAN interface not found",
+			fmt.Sprintf("Interface %q on node %q could not be imported", iface, nodeName),
+		)
+
+		return
+	}
+
+	diags := resp.State.Set(ctx, state)
+	resp.Diagnostics.Append(diags...)
+}

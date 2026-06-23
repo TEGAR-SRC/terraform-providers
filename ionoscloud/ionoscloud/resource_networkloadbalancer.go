@@ -1,0 +1,508 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	cloudapiflowlog "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/flowlog"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+)
+
+func resourceNetworkLoadBalancer() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceNetworkLoadBalancerCreate,
+		ReadContext:   resourceNetworkLoadBalancerRead,
+		UpdateContext: resourceNetworkLoadBalancerUpdate,
+		DeleteContext: resourceNetworkLoadBalancerDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceNetworkLoadBalancerImport,
+		},
+		Schema: map[string]*schema.Schema{
+
+			"name": {
+				Type:             schema.TypeString,
+				Description:      "A name of that Network Load Balancer",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"listener_lan": {
+				Type:        schema.TypeInt,
+				Description: "Id of the listening LAN. (inbound)",
+				Required:    true,
+			},
+			"ips": {
+				Type: schema.TypeList,
+				Description: "Collection of IP addresses of the Network Load Balancer. (inbound and outbound) IP of the " +
+					"listenerLan must be a customer reserved IP for the public load balancer and private IP " +
+					"for the private load balancer.",
+				Optional: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"target_lan": {
+				Type:        schema.TypeInt,
+				Description: "Id of the balanced private target LAN. (outbound)",
+				Required:    true,
+			},
+			"lb_private_ips": {
+				Type: schema.TypeList,
+				Description: "Collection of private IP addresses with subnet mask of the Network Load Balancer. IPs " +
+					"must contain valid subnet mask. If user will not provide any IP then the system will " +
+					"generate one IP with /24 subnet.",
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"central_logging": {
+				Type:        schema.TypeBool,
+				Description: "Turn logging on and off for this product. Default value is 'false'.",
+				Optional:    true,
+				Default:     false,
+			},
+			"logging_format": {
+				Type:        schema.TypeString,
+				Description: "Specifies the format of the logs.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+				ForceNew:    true,
+			},
+			"flowlog": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     cloudapiflowlog.FlowlogSchemaResource,
+				MaxItems: 1,
+				Description: `Only 1 flow log can be configured. Only the name field can change as part of an update. Flow logs holistically capture network information such as source and destination 
+IP addresses, source and destination ports, number of packets, amount of bytes, 
+the start and end time of the recording, and the type of protocol – 
+and log the extent to which your instances are being accessed.`,
+			},
+		},
+		Timeouts:      &resourceDefaultTimeouts,
+		CustomizeDiff: ForceNewForFlowlogChanges,
+	}
+}
+
+func resourceNetworkLoadBalancerCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	networkLoadBalancer := ionoscloud.NetworkLoadBalancer{
+		Properties: &ionoscloud.NetworkLoadBalancerProperties{},
+	}
+
+	if name, nameOk := d.GetOk("name"); nameOk {
+		name := name.(string)
+		networkLoadBalancer.Properties.Name = &name
+	} else {
+		return diagutil.ToDiags(d, fmt.Errorf("name must be provided for network loadbalancer"), nil)
+	}
+
+	if listenerLan, listenerLanOk := d.GetOk("listener_lan"); listenerLanOk {
+		listenerLan := int32(listenerLan.(int))
+		networkLoadBalancer.Properties.ListenerLan = &listenerLan
+	} else {
+		return diagutil.ToDiags(d, fmt.Errorf("listener lan must be provided for network loadbalancer"), nil)
+	}
+
+	if targetLan, targetLanOk := d.GetOk("target_lan"); targetLanOk {
+		targetLan := int32(targetLan.(int))
+		networkLoadBalancer.Properties.TargetLan = &targetLan
+	} else {
+		return diagutil.ToDiags(d, fmt.Errorf("target lan must be provided for network loadbalancer"), nil)
+	}
+
+	if centralLogging, centralLoggingOk := d.GetOk("central_logging"); centralLoggingOk {
+		centralLogging := centralLogging.(bool)
+		networkLoadBalancer.Properties.CentralLogging = &centralLogging
+	}
+
+	if loggingFormat, loggingFormatOk := d.GetOk("logging_format"); loggingFormatOk {
+		loggingFormat := loggingFormat.(string)
+		networkLoadBalancer.Properties.LoggingFormat = &loggingFormat
+	}
+
+	if ipsVal, ipsOk := d.GetOk("ips"); ipsOk {
+		ipsVal := ipsVal.([]any)
+		if ipsVal != nil {
+			ips := make([]string, len(ipsVal), len(ipsVal))
+			for idx := range ipsVal {
+				ips[idx] = fmt.Sprint(ipsVal[idx])
+			}
+			networkLoadBalancer.Properties.Ips = &ips
+		}
+	}
+
+	if lbPrivateIpsVal, lbPrivateIpsOk := d.GetOk("lb_private_ips"); lbPrivateIpsOk {
+		lbPrivateIpsVal := lbPrivateIpsVal.([]any)
+		if lbPrivateIpsVal != nil {
+			lbPrivateIps := make([]string, len(lbPrivateIpsVal), len(lbPrivateIpsVal))
+			for idx := range lbPrivateIpsVal {
+				lbPrivateIps[idx] = fmt.Sprint(lbPrivateIpsVal[idx])
+			}
+			networkLoadBalancer.Properties.LbPrivateIps = &lbPrivateIps
+		}
+	}
+
+	if flowLogs, ok := d.GetOk("flowlog"); ok {
+		networkLoadBalancer.Entities = &ionoscloud.NetworkLoadBalancerEntities{
+			Flowlogs: &ionoscloud.FlowLogs{
+				Items: &[]ionoscloud.FlowLog{},
+			},
+		}
+		if flowLogList, ok := flowLogs.([]any); ok {
+			for _, flowLogData := range flowLogList {
+				if flowLog, ok := flowLogData.(map[string]any); ok {
+					*networkLoadBalancer.Entities.Flowlogs.Items = append(*networkLoadBalancer.Entities.Flowlogs.Items, cloudapiflowlog.GetFlowlogFromMap(flowLog))
+				}
+			}
+		}
+	}
+	dcID := d.Get("datacenter_id").(string)
+
+	networkLoadBalancerResp, apiResponse, err := client.NetworkLoadBalancersApi.DatacentersNetworkloadbalancersPost(ctx, dcID).NetworkLoadBalancer(networkLoadBalancer).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		d.SetId("")
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error creating network loadbalancer: %w, %s", err, responseBody(apiResponse)), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	d.SetId(*networkLoadBalancerResp.Id)
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+		if bundleclient.IsRequestFailed(errState) {
+			d.SetId("")
+		}
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	return resourceNetworkLoadBalancerRead(ctx, d, meta)
+}
+
+func resourceNetworkLoadBalancerRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	networkLoadBalancer, apiResponse, err := client.NetworkLoadBalancersApi.DatacentersNetworkloadbalancersFindByNetworkLoadBalancerId(ctx, dcID, d.Id()).Depth(3).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		tflog.Info(ctx, "network load balancer not found", map[string]any{"nlb_id": d.Id(), "error": err.Error()})
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil
+		}
+	}
+
+	tflog.Info(ctx, "retrieved network load balancer", map[string]any{"nlb_id": d.Id()})
+
+	if err := setNetworkLoadBalancerData(d, &networkLoadBalancer); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
+
+func resourceNetworkLoadBalancerUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	request := ionoscloud.NetworkLoadBalancer{
+		Properties: &ionoscloud.NetworkLoadBalancerProperties{},
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	if d.HasChange("name") {
+		_, v := d.GetChange("name")
+		vStr := v.(string)
+		request.Properties.Name = &vStr
+	}
+
+	if d.HasChange("listener_lan") {
+		_, v := d.GetChange("listener_lan")
+		vInt := int32(v.(int))
+		request.Properties.ListenerLan = &vInt
+	}
+
+	if d.HasChange("target_lan") {
+		_, v := d.GetChange("target_lan")
+		vInt := int32(v.(int))
+		request.Properties.TargetLan = &vInt
+	}
+
+	if d.HasChange("central_logging") {
+		_, v := d.GetChange("central_logging")
+		vBool := v.(bool)
+		request.Properties.CentralLogging = &vBool
+	}
+
+	if d.HasChange("loggingFormat") {
+		_, v := d.GetChange("loggingFormat")
+		vStr := v.(string)
+		request.Properties.LoggingFormat = &vStr
+	}
+
+	if d.HasChange("ips") {
+		oldIps, newIps := d.GetChange("ips")
+		tflog.Info(ctx, "network load balancer ips changed", map[string]any{"old": oldIps, "new": newIps})
+		ipsVal := newIps.([]any)
+		ips := make([]string, 0)
+		if ipsVal != nil {
+			for _, ip := range ipsVal {
+				ips = append(ips, ip.(string))
+			}
+		}
+		if len(ips) > 0 {
+			request.Properties.Ips = &ips
+		} else {
+			return diagutil.ToDiags(d, fmt.Errorf("you can not empty the ips field for networkloadbalancer"), nil)
+		}
+	}
+
+	if d.HasChange("lb_private_ips") {
+		oldLbPrivateIps, newLbPrivateIps := d.GetChange("lb_private_ips")
+		tflog.Info(ctx, "network load balancer lb_private_ips changed", map[string]any{"old": oldLbPrivateIps, "new": newLbPrivateIps})
+		lbPrivateIpsVal := newLbPrivateIps.([]any)
+		lbPrivateIps := make([]string, 0)
+		if lbPrivateIpsVal != nil {
+			for _, privateIp := range lbPrivateIpsVal {
+				lbPrivateIps = append(lbPrivateIps, privateIp.(string))
+			}
+		}
+		if len(lbPrivateIps) == 0 {
+			return diagutil.ToDiags(d, fmt.Errorf("you can not empty the lbPrivateIps field for networkloadbalancer"), nil)
+		}
+		request.Properties.LbPrivateIps = &lbPrivateIps
+	}
+
+	if d.HasChange("flowlog") {
+		old, newV := d.GetChange("flowlog")
+		var firstFlowLogID = ""
+		if old != nil && len(old.([]any)) > 0 {
+			firstFlowLogID = old.([]any)[0].(map[string]any)["id"].(string)
+		}
+
+		if newV.([]any) != nil && len(newV.([]any)) > 0 {
+			for _, val := range newV.([]any) {
+				if flowLogMap, ok := val.(map[string]any); ok {
+					flowLog := cloudapiflowlog.GetFlowlogFromMap(flowLogMap)
+					fw := cloudapiflowlog.Service{
+						D:      d,
+						Client: client,
+					}
+					err := fw.CreateOrPatchForNLB(ctx, dcID, d.Id(), firstFlowLogID, flowLog)
+					if err != nil {
+						// if we have a create that failed, we do not want to save in state
+						// saving in state would mean a diff that would force a re-create
+						if firstFlowLogID == "" {
+							_ = d.Set("flowlog", nil)
+						}
+						return diagutil.ToDiags(d, err, nil)
+					}
+				}
+			}
+		}
+	}
+
+	_, apiResponse, err := client.NetworkLoadBalancersApi.DatacentersNetworkloadbalancersPatch(ctx, dcID, d.Id()).NetworkLoadBalancerProperties(*request.Properties).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while updating a network loadbalancer: %w \n ApiError: %s", err, responseBody(apiResponse)), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutUpdate); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	return resourceNetworkLoadBalancerRead(ctx, d, meta)
+}
+
+func resourceNetworkLoadBalancerDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	apiResponse, err := client.NetworkLoadBalancersApi.DatacentersNetworkloadbalancersDelete(ctx, dcID, d.Id()).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while deleting a network loadbalancer: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutDelete); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	d.SetId("")
+
+	return nil
+}
+
+func resourceNetworkLoadBalancerImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	importID := d.Id()
+
+	location, parts := splitImportID(importID, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf(
+			"invalid import identifier: expected one of <location>:<datacenter>/<networkloadbalancer> or "+
+				"<datacenter>/<networkloadbalancer>, got: %s", importID,
+		)
+	}
+
+	if err := validateImportIDParts(parts); err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("failed validating import identifier %q: %w", importID, err), nil)
+	}
+
+	dcID := parts[0]
+	networkLoadBalancerID := parts[1]
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+
+	networkLoadBalancer, apiResponse, err := client.NetworkLoadBalancersApi.DatacentersNetworkloadbalancersFindByNetworkLoadBalancerId(ctx, dcID, networkLoadBalancerID).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		tflog.Info(ctx, "network load balancer not found on import", map[string]any{"nlb_id": networkLoadBalancerID, "error": err.Error()})
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("unable to find network load balancer %q", networkLoadBalancerID), nil)
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("an error occurred while retrieving network load balancer  %q: %w ", networkLoadBalancerID, err), nil)
+	}
+
+	if err := d.Set("datacenter_id", dcID); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	if err := d.Set("location", location); err != nil {
+		return nil, err
+	}
+
+	if err := setNetworkLoadBalancerData(d, &networkLoadBalancer); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+
+	return []*schema.ResourceData{d}, nil
+}
+
+func setNetworkLoadBalancerData(d *schema.ResourceData, networkLoadBalancer *ionoscloud.NetworkLoadBalancer) error {
+
+	if networkLoadBalancer.Id != nil {
+		d.SetId(*networkLoadBalancer.Id)
+	}
+
+	if networkLoadBalancer.Properties != nil {
+		if networkLoadBalancer.Properties.Name != nil {
+			err := d.Set("name", *networkLoadBalancer.Properties.Name)
+			if err != nil {
+				return fmt.Errorf("error while setting name property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.ListenerLan != nil {
+			err := d.Set("listener_lan", *networkLoadBalancer.Properties.ListenerLan)
+			if err != nil {
+				return fmt.Errorf("error while setting listener_lan property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.TargetLan != nil {
+			err := d.Set("target_lan", *networkLoadBalancer.Properties.TargetLan)
+			if err != nil {
+				return fmt.Errorf("error while setting target_lan property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.Ips != nil {
+			err := d.Set("ips", *networkLoadBalancer.Properties.Ips)
+			if err != nil {
+				return fmt.Errorf("error while setting ips property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.CentralLogging != nil {
+			err := d.Set("central_logging", *networkLoadBalancer.Properties.CentralLogging)
+			if err != nil {
+				return fmt.Errorf("error while setting central_logging property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.LoggingFormat != nil {
+			err := d.Set("logging_format", *networkLoadBalancer.Properties.LoggingFormat)
+			if err != nil {
+				return fmt.Errorf("error while setting logging_format property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+
+		if networkLoadBalancer.Properties.LbPrivateIps != nil {
+			err := d.Set("lb_private_ips", *networkLoadBalancer.Properties.LbPrivateIps)
+			if err != nil {
+				return fmt.Errorf("error while setting lb_private_ips property for network load balancer %s: %w", d.Id(), err)
+			}
+		}
+		if networkLoadBalancer.Entities != nil && networkLoadBalancer.Entities.Flowlogs != nil &&
+			networkLoadBalancer.Entities.Flowlogs.Items != nil && len(*networkLoadBalancer.Entities.Flowlogs.Items) > 0 {
+			var flowlogs []map[string]any
+			for _, flowLog := range *networkLoadBalancer.Entities.Flowlogs.Items {
+				result := map[string]any{}
+				result, err := utils.DecodeStructToMap(flowLog.Properties)
+				if err != nil {
+					return err
+				}
+				result["id"] = *flowLog.Id
+				flowlogs = append(flowlogs, result)
+			}
+			if err := d.Set("flowlog", flowlogs); err != nil {
+				return fmt.Errorf("error setting flowlog %w", err)
+			}
+		}
+	}
+	return nil
+}

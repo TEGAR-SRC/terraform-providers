@@ -1,0 +1,126 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	dbaasservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/dbaas"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceDbaasPgSqlBackups() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceDbaasPgSqlReadBackups,
+		Schema: map[string]*schema.Schema{
+			"cluster_id": {
+				Type:     schema.TypeString,
+				Required: true,
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+			},
+			"cluster_backups": {
+				Type:        schema.TypeList,
+				Description: "list of backups",
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"id": {
+							Type:        schema.TypeString,
+							Description: "The unique ID of the resource.",
+							Computed:    true,
+						},
+						"cluster_id": {
+							Type:        schema.TypeString,
+							Description: "The unique ID of the cluster",
+							Computed:    true,
+						},
+						"type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"size": {
+							Type:        schema.TypeInt,
+							Description: "Size of all base backups including the wal size in MB.",
+							Computed:    true,
+						},
+						"location": {
+							Type:        schema.TypeString,
+							Description: "The Object Storage location where the backups will be stored.",
+							Computed:    true,
+						},
+						"version": {
+							Type:        schema.TypeString,
+							Description: "The PostgreSQL version this backup was created from.",
+							Computed:    true,
+						},
+						"is_active": {
+							Type:        schema.TypeBool,
+							Description: "Whether a cluster currently backs up data to this backup.",
+							Computed:    true,
+						},
+						"earliest_recovery_target_time": {
+							Type:        schema.TypeString,
+							Description: "The oldest available timestamp to which you can restore.",
+							Computed:    true,
+						},
+						"metadata": {
+							Type:        schema.TypeList,
+							Description: "Metadata of the resource",
+							Computed:    true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"created_date": {
+										Type:        schema.TypeString,
+										Description: "The ISO 8601 creation timestamp.",
+										Computed:    true,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceDbaasPgSqlReadBackups(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewPsqlClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	id, idOk := d.GetOk("cluster_id")
+	idStr := id.(string)
+	if !idOk {
+		return diagutil.ToDiags(d, fmt.Errorf("cluster_id has to be provided in order to search for backups"), nil)
+	}
+
+	/* search by ID */
+	clusterBackups, resp, err := client.GetClusterBackups(ctx, idStr)
+	if resp != nil {
+		tflog.Debug(ctx, "fetched cluster backups", map[string]any{"operation": resp.Operation, "status_code": resp.SafeStatusCode()})
+	}
+
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching backup for cluster with ID %s: %w", idStr, err), &diagutil.ErrorContext{StatusCode: resp.SafeStatusCode()})
+	}
+	if len(clusterBackups.Items) == 0 {
+		return diagutil.ToDiags(d, fmt.Errorf("could not find backups for cluster with ID %s", idStr), nil)
+	}
+
+	if diags := dbaasservice.SetPgSqlClusterBackupData(d, &clusterBackups); diags != nil {
+		return diags
+	}
+
+	return nil
+}

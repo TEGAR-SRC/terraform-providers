@@ -1,0 +1,402 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package zone
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/types/stringset"
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/validators"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster/sdn/zones"
+	proxmoxtypes "github.com/bpg/terraform-provider-proxmox/proxmox/types"
+)
+
+type genericModel struct {
+	ID         types.String    `tfsdk:"id"`
+	IPAM       types.String    `tfsdk:"ipam"`
+	DNS        types.String    `tfsdk:"dns"`
+	ReverseDNS types.String    `tfsdk:"reverse_dns"`
+	DNSZone    types.String    `tfsdk:"dns_zone"`
+	Nodes      stringset.Value `tfsdk:"nodes"`
+	MTU        types.Int64     `tfsdk:"mtu"`
+	Pending    types.Bool      `tfsdk:"pending"`
+	State      types.String    `tfsdk:"state"`
+}
+
+func (m *genericModel) fromAPI(name string, data *zones.ZoneData, diags *diag.Diagnostics) {
+	m.ID = types.StringValue(name)
+
+	m.DNS = m.handleDeletedValue(data.DNS)
+	m.DNSZone = m.handleDeletedValue(data.DNSZone)
+	m.IPAM = m.handleDeletedValue(data.IPAM)
+	m.MTU = types.Int64PointerValue(data.MTU)
+	m.Nodes = stringset.NewValueString(data.Nodes, diags, stringset.WithSeparator(","))
+	m.ReverseDNS = m.handleDeletedValue(data.ReverseDNS)
+	m.State = m.handleDeletedValue(data.State)
+
+	// Set pending to true only if there are actual pending changes
+	m.Pending = types.BoolNull()
+	if data.Pending != nil {
+		hasPendingChanges := false
+
+		if data.Pending.DNS != nil && *data.Pending.DNS != "" {
+			m.applyPendingString(data.Pending.DNS, &m.DNS)
+
+			hasPendingChanges = true
+		}
+
+		if data.Pending.DNSZone != nil && *data.Pending.DNSZone != "" {
+			m.applyPendingString(data.Pending.DNSZone, &m.DNSZone)
+
+			hasPendingChanges = true
+		}
+
+		if data.Pending.IPAM != nil && *data.Pending.IPAM != "" {
+			m.applyPendingString(data.Pending.IPAM, &m.IPAM)
+
+			hasPendingChanges = true
+		}
+
+		if data.Pending.ReverseDNS != nil && *data.Pending.ReverseDNS != "" {
+			m.applyPendingString(data.Pending.ReverseDNS, &m.ReverseDNS)
+
+			hasPendingChanges = true
+		}
+
+		if data.Pending.State != nil && *data.Pending.State != "" {
+			m.applyPendingString(data.Pending.State, &m.State)
+
+			hasPendingChanges = true
+		}
+
+		if data.Pending.MTU != nil && *data.Pending.MTU != 0 {
+			m.MTU = types.Int64Value(*data.Pending.MTU)
+			hasPendingChanges = true
+		}
+
+		if data.Pending.Nodes != nil && len(*data.Pending.Nodes) > 0 {
+			m.Nodes = stringset.NewValueString(data.Pending.Nodes, diags, stringset.WithSeparator(","))
+			hasPendingChanges = true
+		}
+
+		if hasPendingChanges {
+			m.Pending = types.BoolValue(true)
+		}
+	}
+}
+
+func (m *genericModel) toAPI(ctx context.Context, diags *diag.Diagnostics) *zones.Zone {
+	data := &zones.Zone{}
+
+	data.ID = m.ID.ValueString()
+
+	data.IPAM = m.IPAM.ValueStringPointer()
+	data.DNS = m.DNS.ValueStringPointer()
+	data.ReverseDNS = m.ReverseDNS.ValueStringPointer()
+	data.DNSZone = m.DNSZone.ValueStringPointer()
+	data.Nodes = m.Nodes.ValueStringPointer(ctx, diags, stringset.WithSeparator(","))
+
+	if attribute.IsDefined(m.MTU) {
+		data.MTU = m.MTU.ValueInt64Pointer()
+	}
+
+	return data
+}
+
+func (m *genericModel) getID() string {
+	return m.ID.ValueString()
+}
+
+func (m *genericModel) handleDeletedValue(value *string) types.String {
+	if value == nil {
+		return types.StringNull()
+	}
+
+	if *value == "deleted" {
+		return types.StringNull()
+	}
+
+	return types.StringValue(*value)
+}
+
+func (m *genericModel) applyPendingString(pendingValue *string, target *types.String) {
+	if pendingValue != nil && *pendingValue != "" {
+		*target = m.handleDeletedValue(pendingValue)
+	}
+}
+
+func (m *genericModel) applyPendingBool(pendingValue *proxmoxtypes.CustomBool, target *types.Bool) {
+	if pendingValue != nil {
+		*target = types.BoolPointerValue(pendingValue.PointerBool())
+	}
+}
+
+func (m *genericModel) checkDeletedFields(state *genericModel) []string {
+	var toDelete []string
+
+	attribute.CheckDelete(m.IPAM, state.IPAM, &toDelete, "ipam")
+	attribute.CheckDelete(m.DNS, state.DNS, &toDelete, "dns")
+	attribute.CheckDelete(m.ReverseDNS, state.ReverseDNS, &toDelete, "reversedns")
+	attribute.CheckDelete(m.DNSZone, state.DNSZone, &toDelete, "dnszone")
+	// Note: MTU intentionally omitted - cannot be unset once configured due to Proxmox API limitation
+	// (pending object returns "deleted" string which cannot unmarshal to int64)
+	attribute.CheckDelete(m.Nodes, state.Nodes, &toDelete, "nodes")
+	attribute.CheckDelete(m.State, state.State, &toDelete, "state")
+
+	return toDelete
+}
+
+func genericAttributesWith(extraAttributes map[string]schema.Attribute) map[string]schema.Attribute {
+	// Start with generic attributes as the base
+	result := map[string]schema.Attribute{
+		"dns": schema.StringAttribute{
+			Description: "DNS API server address.",
+			Optional:    true,
+		},
+		"dns_zone": schema.StringAttribute{
+			Description: "DNS domain name. The DNS zone must already exist on the DNS server.",
+			MarkdownDescription: "DNS domain name. Used to register hostnames, such as `<hostname>.<domain>`. " +
+				"The DNS zone must already exist on the DNS server.",
+			Optional: true,
+		},
+		"id": schema.StringAttribute{
+			Description: "The unique identifier of the SDN zone.",
+			Required:    true,
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.RequiresReplace(),
+			},
+			Validators: validators.SDNID(),
+		},
+		"ipam": schema.StringAttribute{
+			Description: "IP Address Management system.",
+			Optional:    true,
+		},
+		"mtu": schema.Int64Attribute{
+			Description: "MTU value for the zone. There is no support to reset this value back to PVE default " +
+				"once set due to API limitation.",
+			Optional: true,
+			Computed: true,
+			PlanModifiers: []planmodifier.Int64{
+				int64planmodifier.UseNonNullStateForUnknown(),
+			},
+		},
+		"nodes": stringset.ResourceAttribute("The Proxmox nodes which the zone and associated VNets should be deployed on", "", stringset.WithOptional()),
+		"pending": schema.BoolAttribute{
+			Description: "Indicates if the zone has pending configuration changes that need to be applied.",
+			Computed:    true,
+		},
+		"state": schema.StringAttribute{
+			Description: "Indicates the current state of the zone.",
+			Computed:    true,
+		},
+		"reverse_dns": schema.StringAttribute{
+			Description: "Reverse DNS API server address.",
+			Optional:    true,
+		},
+	}
+
+	// Add extra attributes, allowing them to override generic ones if needed
+	if extraAttributes != nil {
+		maps.Copy(result, extraAttributes)
+	}
+
+	return result
+}
+
+type zoneModel interface {
+	fromAPI(name string, data *zones.ZoneData, diags *diag.Diagnostics)
+	toAPI(ctx context.Context, diags *diag.Diagnostics) *zones.Zone
+	getID() string
+	getGenericModel() *genericModel
+	checkDeletedFields(state zoneModel) []string
+}
+
+type zoneResourceConfig struct {
+	typeNameSuffix string
+	zoneType       string
+	modelFunc      func() zoneModel
+}
+
+type genericZoneResource struct {
+	client *zones.Client
+	config zoneResourceConfig
+}
+
+func newGenericZoneResource(cfg zoneResourceConfig) resource.Resource {
+	return &genericZoneResource{config: cfg}
+}
+
+func (r *genericZoneResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + r.config.typeNameSuffix
+}
+
+func (r *genericZoneResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	cfg, ok := req.ProviderData.(config.Resource)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected config.Resource, got: %T", req.ProviderData),
+		)
+
+		return
+	}
+
+	r.client = cfg.Client.Cluster().SDNZones()
+}
+
+func (r *genericZoneResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	plan := r.config.modelFunc()
+	resp.Diagnostics.Append(req.Plan.Get(ctx, plan)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	newZone := plan.toAPI(ctx, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	newZone.Type = new(r.config.zoneType)
+
+	if err := r.client.CreateZone(ctx, newZone); err != nil {
+		resp.Diagnostics.AddError("Unable to Create SDN Zone", err.Error())
+		return
+	}
+
+	r.readAndSetState(ctx, plan.getID(), &resp.State, &resp.Diagnostics)
+}
+
+func (r *genericZoneResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	state := r.config.modelFunc()
+	resp.Diagnostics.Append(req.State.Get(ctx, state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	zone, err := r.client.GetZoneWithParams(ctx, state.getID(), &sdn.QueryParams{Pending: proxmoxtypes.CustomBool(true).Pointer()})
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+
+		resp.Diagnostics.AddError("Unable to Read SDN Zone", err.Error())
+
+		return
+	}
+
+	r.setModelFromZone(ctx, zone, &resp.State, &resp.Diagnostics)
+}
+
+func (r *genericZoneResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	plan := r.config.modelFunc()
+	resp.Diagnostics.Append(req.Plan.Get(ctx, plan)...)
+
+	state := r.config.modelFunc()
+	resp.Diagnostics.Append(req.State.Get(ctx, state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	updateZone := plan.toAPI(ctx, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	toDelete := plan.checkDeletedFields(state)
+	update := &zones.ZoneUpdate{
+		Zone:   *updateZone,
+		Delete: toDelete,
+	}
+
+	if err := r.client.UpdateZone(ctx, update); err != nil {
+		resp.Diagnostics.AddError("Unable to Update SDN Zone", err.Error())
+
+		return
+	}
+
+	r.readAndSetState(ctx, plan.getID(), &resp.State, &resp.Diagnostics)
+}
+
+func (r *genericZoneResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	state := r.config.modelFunc()
+	resp.Diagnostics.Append(req.State.Get(ctx, state)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if err := r.client.DeleteZone(ctx, state.getID()); err != nil &&
+		!errors.Is(err, api.ErrResourceDoesNotExist) {
+		resp.Diagnostics.AddError("Unable to Delete SDN Zone", err.Error())
+	}
+}
+
+func (r *genericZoneResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	zone, err := r.client.GetZoneWithParams(ctx, req.ID, &sdn.QueryParams{Pending: proxmoxtypes.CustomBool(true).Pointer()})
+	if err != nil {
+		if errors.Is(err, api.ErrResourceDoesNotExist) {
+			resp.Diagnostics.AddError(fmt.Sprintf("Zone %s does not exist", req.ID), err.Error())
+			return
+		}
+
+		resp.Diagnostics.AddError(fmt.Sprintf("Unable to Import SDN Zone %s", req.ID), err.Error())
+
+		return
+	}
+
+	r.setModelFromZone(ctx, zone, &resp.State, &resp.Diagnostics)
+}
+
+// Schema is required to satisfy the resource.Resource interface. It should be implemented by the specific resource.
+func (r *genericZoneResource) Schema(_ context.Context, _ resource.SchemaRequest, _ *resource.SchemaResponse) {
+	// Intentionally left blank. Should be set by the specific resource.
+}
+
+func (r *genericZoneResource) readAndSetState(ctx context.Context, zoneID string, state *tfsdk.State, diags *diag.Diagnostics) {
+	zone, err := r.client.GetZoneWithParams(ctx, zoneID, &sdn.QueryParams{Pending: proxmoxtypes.CustomBool(true).Pointer()})
+	if err != nil {
+		diags.AddError("Unable to Read SDN Zone", err.Error())
+		return
+	}
+
+	r.setModelFromZone(ctx, zone, state, diags)
+}
+
+func (r *genericZoneResource) setModelFromZone(ctx context.Context, zone *zones.ZoneData, state *tfsdk.State, diags *diag.Diagnostics) {
+	readModel := r.config.modelFunc()
+	readModel.fromAPI(zone.ID, zone, diags)
+
+	if diags.HasError() {
+		return
+	}
+
+	diags.Append(state.Set(ctx, readModel)...)
+}

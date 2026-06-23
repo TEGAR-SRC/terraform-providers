@@ -1,0 +1,50 @@
+---
+subcategory: "NAT Gateway"
+layout: "ionoscloud"
+page_title: "IONOS CLOUD : ionoscloud_natgateway"
+sidebar_current: "docs-ionoscloud-datasource-natgateway"
+description: |-
+  Get information on a Nat Gateway
+---
+
+# ionoscloud_natgateway
+
+The **NAT gateway data source** can be used to search for and return existing NAT Gateways.
+If a single match is found, it will be returned. If your search results in multiple matches, an error will be returned.
+When this happens, please refine your search string so that it is specific enough to return only one result.
+
+## Example Usage
+### By ID
+```hcl
+data "ionoscloud_natgateway" "example" {
+  datacenter_id = "datacenter_id"
+  id			= "nat_gateway_id"
+}
+```
+
+### By Name
+```hcl
+data "ionoscloud_natgateway" "example" {
+  datacenter_id = "datacenter_id"
+  name			= "NAT Gateway Example"
+}
+```
+
+## Argument Reference
+
+* `datacenter_id` - (Required) Datacenter's UUID.
+* `name` - (Optional) Name of an existing network load balancer forwarding rule that you want to search for.
+* `id` - (Optional) ID of the network load balancer forwarding rule you want to search for.
+
+`datacenter_id` and either `name` or `id` must be provided. If none, or both of `name` and `id` are provided, the datasource will return an error.
+
+## Attributes Reference
+
+The following attributes are returned by the datasource:
+
+* `id` - Id of that natgateway
+* `name` - Name of that natgateway
+* `public_ips` - Collection of public IP addresses of the NAT gateway. Should be customer reserved IP addresses in that location
+* `lans` - Collection of LANs connected to the NAT gateway. IPs must contain valid subnet mask. If user will not provide any IP then system will generate an IP with /24 subnet.
+    * `id` - Id for the LAN connected to the NAT gateway
+    * `gateway_ips` - Collection of gateway IP addresses of the NAT gateway. Will be auto-generated if not provided. Should ideally be an IP belonging to the same subnet as the LAN

@@ -1,0 +1,9 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_managed_certificate" "{{ .RName }}" {
+  name        = "{{ .Name }}--{{ .RInt }}"
+  domain_names = [{{ .DomainNames | quoteEach | join ", " }}]
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+}

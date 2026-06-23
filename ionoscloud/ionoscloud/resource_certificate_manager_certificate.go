@@ -1,0 +1,195 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cert"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func resourceCertificateManager() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceCertificateManagerCreate,
+		ReadContext:   resourceCertificateManagerRead,
+		UpdateContext: resourceCertificateManagerUpdate,
+		DeleteContext: resourceCertificateManagerDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceCertificateManagerImport,
+		},
+		Schema: map[string]*schema.Schema{
+			"name": {
+				Type:             schema.TypeString,
+				Description:      "The certificate name",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"certificate": {
+				Type:                  schema.TypeString,
+				Description:           "The certificate body in PEM format. This attribute is immutable.",
+				Required:              true,
+				ValidateDiagFunc:      validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+				DiffSuppressFunc:      utils.DiffWithoutNewLines,
+				DiffSuppressOnRefresh: true,
+			},
+			"certificate_chain": {
+				Type:                  schema.TypeString,
+				Description:           "The certificate chain. This attribute is immutable.",
+				Optional:              true,
+				ValidateDiagFunc:      validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+				DiffSuppressFunc:      utils.DiffWithoutNewLines,
+				DiffSuppressOnRefresh: true,
+			},
+			"private_key": {
+				Type:             schema.TypeString,
+				Description:      "The private key blob. This attribute is immutable.",
+				Required:         true,
+				Sensitive:        true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+		},
+		CustomizeDiff: checkCertImmutableFields,
+		Timeouts:      &resourceDefaultTimeouts,
+	}
+}
+
+func checkCertImmutableFields(_ context.Context, diff *schema.ResourceDiff, _ any) error {
+
+	// we do not want to check in case of resource creation
+	if diff.Id() == "" {
+		return nil
+	}
+
+	if diff.HasChange("certificate") {
+		oldV, newV := diff.GetChange("certificate")
+		old := utils.RemoveNewLines(oldV.(string))
+		newStr := utils.RemoveNewLines(newV.(string))
+		// we get extraneous newlines in the certificate, so we must remove them before checking equality
+		if !strings.EqualFold(old, newStr) {
+			return fmt.Errorf("certificate %s", ImmutableError)
+		}
+	}
+
+	if diff.HasChange("certificate_chain") {
+		oldV, newV := diff.GetChange("certificate_chain")
+		old := utils.RemoveNewLines(oldV.(string))
+		newStr := utils.RemoveNewLines(newV.(string))
+		if !strings.EqualFold(old, newStr) {
+			return fmt.Errorf("certificate_chain %s", ImmutableError)
+		}
+	}
+
+	if diff.HasChange("private_key") {
+		return fmt.Errorf("private_key %s", ImmutableError)
+	}
+
+	return nil
+
+}
+
+func resourceCertificateManagerCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+
+	certPostDto, err := cert.GetCertPostDto(d)
+	if err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	certificateDto, apiResponse, err := client.CreateCertificate(ctx, *certPostDto)
+	if err != nil {
+		d.SetId("")
+		return diagutil.ToDiags(d, fmt.Errorf("error creating certificate: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	d.SetId(certificateDto.Id)
+
+	if err = utils.WaitForResourceToBeReady(ctx, d, client.IsCertReady); err != nil {
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String()})
+	}
+
+	return resourceCertificateManagerRead(ctx, d, meta)
+}
+
+func resourceCertificateManagerRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+
+	certDto, apiResponse, err := client.GetCertificate(ctx, d.Id())
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			tflog.Info(ctx, "certificate not found", map[string]any{"certificate_id": d.Id(), "error": err.Error()})
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	tflog.Info(ctx, "retrieved certificate", map[string]any{"certificate_id": d.Id()})
+
+	if err := cert.SetCertificateData(d, &certDto); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	return nil
+}
+
+func resourceCertificateManagerUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+
+	certPatchDto := cert.GetCertPatchDto(d)
+
+	_, apiResponse, err := client.UpdateCertificate(ctx, d.Id(), *certPatchDto)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while updating certificate: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if err = utils.WaitForResourceToBeReady(ctx, d, client.IsCertReady); err != nil {
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String()})
+	}
+
+	return resourceCertificateManagerRead(ctx, d, meta)
+}
+
+func resourceCertificateManagerDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+
+	apiResponse, err := client.DeleteCertificate(ctx, d.Id())
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while deleting the certificate: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	err = utils.WaitForResourceToBeDeleted(ctx, d, client.IsCertDeleted)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("deleting %w", err), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String()})
+	}
+
+	tflog.Info(ctx, "successfully deleted certificate", map[string]any{"certificate_id": d.Id()})
+
+	d.SetId("")
+
+	return nil
+}
+
+func resourceCertificateManagerImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	client := meta.(bundleclient.SdkBundle).CertManagerClient
+
+	certID := d.Id()
+	certDto, apiResponse, err := client.GetCertificate(ctx, d.Id())
+	if err != nil {
+		if apiResponse.HttpNotFound() {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("unable to find cert %q", certID), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("an error occurred while retrieving the cert %q, %w", certID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if err := cert.SetCertificateData(d, &certDto); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	return []*schema.ResourceData{d}, nil
+}

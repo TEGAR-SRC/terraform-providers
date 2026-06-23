@@ -1,0 +1,125 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/ionos-cloud/sdk-go-bundle/products/dbaas/mongo/v2"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	dbaasservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/dbaas"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceDbassMongoTemplate() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceDbassMongoTemplateRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:             schema.TypeString,
+				Description:      "The unique ID of the template.",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+				Optional:         true,
+				Computed:         true,
+			},
+			"name": {
+				Type:        schema.TypeString,
+				Description: "The name of the template.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"partial_match": {
+				Type:        schema.TypeBool,
+				Description: "Whether partial matching is allowed or not when using the name filter.",
+				Default:     false,
+				Optional:    true,
+			},
+			"edition": {
+				Type:        schema.TypeString,
+				Description: "The edition of the template (e.g. enterprise).",
+				Computed:    true,
+			},
+			"cores": {
+				Type:        schema.TypeInt,
+				Description: "The number of CPU cores.",
+				Computed:    true,
+			},
+			"ram": {
+				Type:        schema.TypeInt,
+				Description: "The amount of memory in GB.",
+				Computed:    true,
+			},
+			"storage_size": {
+				Type:        schema.TypeInt,
+				Description: "The amount of storage size in GB.",
+				Computed:    true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceDbassMongoTemplateRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewMongoClient(ctx, "")
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	id, idOk := d.GetOk("id")
+	name, nameOk := d.GetOk("name")
+
+	// Initial checks.
+	if idOk && nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("name and ID cannot be both specified at the same time"), nil)
+	}
+	if !idOk && !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide a template ID or name"), nil)
+	}
+	retrievedTemplates, apiResponse, err := client.GetTemplates(ctx)
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching dbaas mongo templates: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	var templates []mongo.TemplateResponse
+	partialMatch := d.Get("partial_match").(bool)
+	if retrievedTemplates.Items != nil {
+		for _, retrievedTemplate := range retrievedTemplates.Items {
+			// Filter using the template ID or name.
+			if (idOk && *retrievedTemplate.Id == id.(string)) ||
+				(nameOk && matchesName(ctx, retrievedTemplate, name.(string), partialMatch)) {
+				templates = append(templates, retrievedTemplate)
+			}
+		}
+	}
+	if templates == nil {
+		return diagutil.ToDiags(d, fmt.Errorf("no DBaaS Mongo Template found with the specified criteria"), nil)
+	} else if len(templates) > 1 {
+		return diagutil.ToDiags(d, fmt.Errorf("more than one DBaaS Mongo Template found for the specified search criteria"), nil)
+	}
+
+	if err := d.Set("id", *templates[0].Id); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	if err := dbaasservice.SetMongoDBTemplateData(d, templates[0]); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	return nil
+}
+
+// matchesName checks if a template has a specific name. allows for partial matching if partialMatch is true
+func matchesName(ctx context.Context, template mongo.TemplateResponse, name string, partialMatch bool) bool {
+	if template.Properties == nil || template.Properties.Name == nil {
+		tflog.Warn(ctx, "template missing properties or name", map[string]any{"template_id": *template.Id})
+		return false
+	}
+
+	if partialMatch {
+		return strings.Contains(*template.Properties.Name, name)
+	}
+
+	return *template.Properties.Name == name
+}

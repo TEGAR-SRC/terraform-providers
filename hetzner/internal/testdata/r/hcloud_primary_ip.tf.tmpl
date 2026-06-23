@@ -1,0 +1,33 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_primary_ip" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  name        = "{{ .Name }}--{{ .RInt }}"
+  type = "{{ .Type }}"
+  {{- if .Location }}
+  location       = "{{ .Location }}"
+  {{ end }}
+  {{- if .Datacenter }}
+  datacenter       = "{{ .Datacenter }}"
+  {{ end }}
+  {{- if .AssigneeType }}
+  assignee_type       = "{{ .AssigneeType }}"
+  {{ end }}
+  {{- if .AssigneeID }}
+  assignee_id       = {{ .AssigneeID }}
+  {{ end }}
+
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+
+  {{- if ne .AutoDelete nil }}
+  auto_delete       = {{ .AutoDelete }}
+  {{- end }}
+  {{- if .DeleteProtection }}
+  delete_protection = {{ .DeleteProtection }}
+  {{ end }}
+{{- if .Raw }}
+{{ .Raw | indent 2 }}
+{{- end }}
+}

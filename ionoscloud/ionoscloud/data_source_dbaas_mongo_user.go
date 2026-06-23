@@ -1,0 +1,128 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	mongo "github.com/ionos-cloud/sdk-go-bundle/products/dbaas/mongo/v2"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/dbaas"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceDbaasMongoUser() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceDbaasMongoReadUser,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:        schema.TypeString,
+				Description: "Id of the backup unit.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+			},
+			"cluster_id": {
+				Type:             schema.TypeString,
+				Description:      "The id of your cluster.",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+			},
+			"username": {
+				Type:             schema.TypeString,
+				Description:      "The username to search for",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"database": {
+				Type:             schema.TypeString,
+				Description:      "The database",
+				Optional:         true,
+				Computed:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"roles": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"role": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "A list of mongodb user roles. Examples: read, readWrite, readAnyDatabase",
+							Computed:    true,
+						},
+						"database": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceDbaasMongoReadUser(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewMongoClient(ctx, d.Get("location").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	clusterIDIf, idOk := d.GetOk("cluster_id")
+	usernameIf, nameOk := d.GetOk("username")
+
+	if !idOk || !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide cluster_id and username"), nil)
+	}
+
+	username := usernameIf.(string)
+	clusterID := clusterIDIf.(string)
+	var user mongo.User
+
+	users, apiResponse, err := client.GetUsers(ctx, clusterID)
+
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching dbaas mongo users: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	var results []mongo.User
+
+	if len(users.Items) > 0 {
+		for _, userItem := range users.Items {
+			if userItem.Properties != nil && strings.EqualFold(userItem.Properties.Username, username) {
+				results = append(results, userItem)
+			}
+		}
+	}
+
+	switch {
+	case len(results) == 0:
+		return diagutil.ToDiags(d, fmt.Errorf("no DBaaS mongo user found with the specified username = %s and cluster_id = %s", username, clusterID), nil)
+	case len(results) > 1:
+		return diagutil.ToDiags(d, fmt.Errorf("more than one DBaaS mongo user found with the specified criteria username = %s and cluster_id = %s", username, clusterID), nil)
+	default:
+		user = results[0]
+	}
+
+	if err := dbaas.SetUserMongoData(d, &user); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	if user.Properties != nil {
+		d.SetId(clusterID + user.Properties.Username)
+	}
+
+	return nil
+
+}

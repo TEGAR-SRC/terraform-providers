@@ -1,0 +1,158 @@
+---
+subcategory: "Compute Engine"
+layout: "ionoscloud"
+page_title: "IONOS CLOUD: volume"
+sidebar_current: "docs-resource-volume"
+description: |-
+  Creates and manages IONOS CLOUD Volume objects.
+---
+
+# ionoscloud_volume
+
+Manages a [Volume](https://docs.ionos.com/cloud/storage-and-backup/block-storage) on IONOS CLOUD.
+
+## Example Usage
+
+A primary volume will be created with the server. If there is a need for additional volumes, this resource handles it.
+
+```hcl
+data "ionoscloud_image" "example" {
+    type                  = "HDD"
+    cloud_init            = "V1"
+    image_alias           = "ubuntu:latest"
+    location              = "us/las"
+}
+
+resource "ionoscloud_datacenter" "example" {
+    name                  = "Datacenter Example"
+    location              = "us/las"
+    description           = "Datacenter Description"
+    sec_auth_protection   = false
+}
+
+resource "ionoscloud_lan" "example" {
+    datacenter_id         = ionoscloud_datacenter.example.id
+    public                = true
+    name                  = "Lan Example"
+}
+
+resource "ionoscloud_ipblock" "example" {
+    location              = ionoscloud_datacenter.example.location
+    size                  = 4
+    name                  = "IP Block Example"
+}
+
+resource "ionoscloud_server" "example" {
+    name                  = "Server Example"
+    datacenter_id         = ionoscloud_datacenter.example.id
+    cores                 = 1
+    ram                   = 1024
+    image_name            = data.ionoscloud_image.example.name
+    image_password        = random_password.server_image_password.result
+    type                  = "ENTERPRISE"
+    volume {
+        name              = "system"
+        size              = 5
+        disk_type         = "SSD Standard"
+        user_data         = "foo"
+        bus               = "VIRTIO"
+        availability_zone = "ZONE_1"
+    }
+    nic {
+        lan               = ionoscloud_lan.example.id
+        name              = "system"
+        dhcp              = true
+        firewall_active   = true
+        firewall_type     = "BIDIRECTIONAL"
+        ips               = [ ionoscloud_ipblock.example.ips[0], ionoscloud_ipblock.example.ips[1] ]
+    firewall {
+        protocol          = "TCP"
+        name              = "SSH"
+        port_range_start  = 22
+        port_range_end    = 22
+        source_mac        = "00:0a:95:9d:68:17"
+        source_ip         = ionoscloud_ipblock.example.ips[2]
+        target_ip         = ionoscloud_ipblock.example.ips[3]
+        type              = "EGRESS"
+    }
+  }
+}
+
+resource "ionoscloud_volume" "example" {
+  datacenter_id           = ionoscloud_datacenter.example.id
+  server_id               = ionoscloud_server.example.id
+  name                    = "Volume Example"
+  availability_zone       = "ZONE_1"
+  size                    = 5
+  disk_type               = "SSD Standard"
+  bus                     = "VIRTIO"
+  image_name              = data.ionoscloud_image.example.name
+  image_password          = random_password.volume_image_password.result
+  user_data               = "foo"
+}
+
+resource "ionoscloud_volume" "example2" {
+  datacenter_id           = ionoscloud_datacenter.example.id
+  server_id               = ionoscloud_server.example.id
+  name                    = "Another Volume Example"
+  availability_zone       = "ZONE_1"
+  size                    = 5
+  disk_type               = "SSD Standard"
+  bus                     = "VIRTIO"
+  licence_type            = "OTHER"
+}
+
+resource "random_password" "server_image_password" {
+  length           = 16
+  special          = false
+}
+
+resource "random_password" "volume_image_password" {
+  length           = 16
+  special          = false
+}
+```
+
+## Argument reference
+
+* `datacenter_id` - (Required)[string] The ID of a Virtual Data Center.
+* `server_id` - (Required)[string] The ID of a server.
+* `disk_type` - (Required)[string] The volume type: HDD or SSD. This property is immutable.
+* `bus` - (Optional)[Boolean] The bus type of the volume: VIRTIO or IDE.
+* `size` -  (Required)[integer] The size of the volume in GB.
+* `ssh_key_path` -  (Optional)[list] List of absolute paths to files containing a public SSH key that will be injected into IONOS CLOUD provided Linux images. Also accepts ssh keys directly. Required for IONOS CLOUD Linux images. Required if `image_password` is not provided. This property is immutable.
+* `ssh_keys` -  (Optional)[list] List of absolute paths to files containing a public SSH key that will be injected into IONOS CLOUD provided Linux images. Also accepts ssh keys directly. Required for IONOS CLOUD Linux images. Required if `image_password` is not provided. This property is immutable.
+* `sshkey` - (Computed) The associated public SSH key.
+* `image_password` - (Optional)[string] Required if `sshkey_path` is not provided.
+* `image_name` - (Optional)[string] The name, ID or alias of the image. May also be a snapshot ID. It is required if `licence_type` is not provided. Attribute is immutable.
+* `image` - (Computed) The image or snapshot UUID.
+* `licence_type` - (Optional)[string] Required if `image_name` is not provided.
+* `name` - (Optional)[string] The name of the volume.
+* `availability_zone` - (Optional)[string] The storage availability zone assigned to the volume: AUTO, ZONE_1, ZONE_2, or ZONE_3. This property is immutable
+* `user_data` - (Optional)[string] The cloud-init configuration for the volume as base64 encoded string. The property is immutable and is only allowed to be set on a new volume creation. This option will work only with cloud-init compatible images.
+* `backup_unit_id`- (Optional)[string] The uuid of the Backup Unit that user has access to. The property is immutable and is only allowed to be set on a new volume creation. It is mandatory to provide either 'public image' or 'imageAlias' in conjunction with this property.
+* `device_number`- (Computed) The Logical Unit Number of the storage volume. Null for volumes not mounted to any VM.
+* `pci_slot`- (Computed) The PCI slot number of the storage volume. Null for volumes not mounted to any VM.
+* `cpu_hot_plug` - (Computed)[string] Is capable of CPU hot plug (no reboot required)
+* `ram_hot_plug` - (Computed)[string] Is capable of memory hot plug (no reboot required)
+* `nic_hot_plug` - (Computed)[string] Is capable of nic hot plug (no reboot required)
+* `nic_hot_unplug` - (Computed)[string] Is capable of nic hot unplug (no reboot required)
+* `disc_virtio_hot_plug` - (Computed)[string] Is capable of Virt-IO drive hot plug (no reboot required)
+* `disc_virtio_hot_unplug` - (Computed)[string] Is capable of Virt-IO drive hot unplug (no reboot required). This works only for non-Windows virtual Machines.
+* `boot_server` - (Computed)[string] The UUID of the attached server.
+* `expose_serial` - (Optional)(Computed) [boolean] Defaults to `false` if not previously set by the image used to create the volume. If set to `true` will expose the serial id of the disk attached to the server. If set to `false` will not expose the serial id. Some operating systems or software solutions require the serial id to be exposed to work properly. Exposing the serial can influence licensed software (e.g. Windows) behavior
+* `require_legacy_bios` - (Optional)(Computed)[boolean] Indicates if the image requires the legacy BIOS for compatibility or specific needs. During creation, if an image is used, the value will be inherited from the image, regardless of the value set in the plan. Later on, the value can be updated.
+
+> **⚠ WARNING**
+>
+> ssh_key_path and ssh_keys fields are immutable.
+> If you want to create a **CUBE** server, the type of the inline volume must be set to **DAS**. In this case, you can not set the `size` argument since it is taken from the `template_uuid` you set in the server.
+
+
+## Import
+
+Resource Volume can be imported using the `resource id`, e.g.
+
+```shell
+terraform import ionoscloud_volume.myvolume datacenter uuid/server uuid/volume uuid
+```

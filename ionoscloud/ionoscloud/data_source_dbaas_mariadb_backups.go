@@ -1,0 +1,129 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	mariadbsdk "github.com/ionos-cloud/sdk-go-bundle/products/dbaas/mariadb/v2"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/dbaas/mariadb"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceDBaaSMariaDBBackups() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceDBaaSMariaDBReadBackups,
+		Schema: map[string]*schema.Schema{
+			"cluster_id": {
+				Type:        schema.TypeString,
+				Description: "The unique ID of the cluster that was backed up",
+				Optional:    true,
+				Computed:    true,
+			},
+			"backup_id": {
+				Type:        schema.TypeString,
+				Description: "The unique ID of the backup",
+				Optional:    true,
+				Computed:    true,
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The cluster location",
+				Optional:    true,
+			},
+			"backups": {
+				Type:        schema.TypeList,
+				Description: "The list of backups",
+				Computed:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"cluster_id": {
+							Type:        schema.TypeString,
+							Description: "The unique ID of the cluster that was backed up",
+							Computed:    true,
+						},
+						"earliest_recovery_target_time": {
+							Type:        schema.TypeString,
+							Description: "The oldest available timestamp to which you can restore",
+							Computed:    true,
+						},
+						"size": {
+							Type:        schema.TypeInt,
+							Description: "Size of all base backups in Mebibytes (MiB). This is at least the sum of all base backup sizes",
+							Computed:    true,
+						},
+						"base_backups": {
+							Type:        schema.TypeList,
+							Description: "The list of backups for the specified cluster",
+							Computed:    true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"size": {
+										Type:        schema.TypeInt,
+										Description: "The size of the backup in Mebibytes (MiB). This is the size of the binary backup file that was stored",
+										Computed:    true,
+									},
+									"created": {
+										Type:        schema.TypeString,
+										Description: "The ISO 8601 creation timestamp",
+										Computed:    true,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceDBaaSMariaDBReadBackups(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).MariaDBClient
+
+	clusterIdIntf, clusterIDOk := d.GetOk("cluster_id")
+	clusterID := clusterIdIntf.(string)
+	backupIDIntf, backupIDOk := d.GetOk("backup_id")
+	backupID := backupIDIntf.(string)
+
+	if !clusterIDOk && !backupIDOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide either the 'cluster_id' or 'backup_id'"), nil)
+	}
+	if clusterIDOk && backupIDOk {
+		return diagutil.ToDiags(d, fmt.Errorf("'cluster_id' and 'backup_id' cannot be specified at the same time"), nil)
+	}
+
+	location := d.Get("location").(string)
+
+	var backups []mariadbsdk.BackupResponse
+	var apiResponse *shared.APIResponse
+	var err error
+	if clusterIDOk {
+		var backupsResponse mariadbsdk.BackupList
+		backupsResponse, apiResponse, err = client.GetClusterBackups(ctx, clusterID, location)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching backups for cluster with ID %s: %w", clusterID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		if backupsResponse.Items == nil {
+			return diagutil.ToDiags(d, fmt.Errorf("expected valid properties in the API response for cluster backups, but received 'nil' instead, cluster ID: %s", clusterID), nil)
+		}
+		backups = backupsResponse.Items
+	} else {
+		var backup mariadbsdk.BackupResponse
+		backup, apiResponse, err = client.FindBackupByID(ctx, backupID, location)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching backup with ID %s: %w", backupID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		if backup.Properties == nil {
+			return diagutil.ToDiags(d, fmt.Errorf("expected valid properties in the API response for backup, but received 'nil' instead, backup ID: %s", backupID), nil)
+		}
+		backups = append(backups, backup)
+	}
+
+	return mariadb.SetMariaDBClusterBackupsData(d, backups)
+}

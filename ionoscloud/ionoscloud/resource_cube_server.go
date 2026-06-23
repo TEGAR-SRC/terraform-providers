@@ -1,0 +1,1160 @@
+package ionoscloud
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/internal/serverutil"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/cloudapifirewall"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/cloudapinic"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/cloudapiserver"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/cloudapi/nsg"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/slice"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func resourceCubeServer() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceCubeServerCreate,
+		ReadContext:   resourceCubeServerRead,
+		UpdateContext: resourceCubeServerUpdate,
+		DeleteContext: serverutil.ResourceCommonServerDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceCubeServerImport,
+		},
+		CustomizeDiff: checkServerImmutableFields,
+
+		Schema: map[string]*schema.Schema{
+			// Cube Server parameters
+			"template_uuid": {
+				Type:     schema.TypeString,
+				Required: true,
+				ForceNew: true,
+			},
+			"name": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"hostname": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				Description:      "The hostname of the resource. Allowed characters are a-z, 0-9 and - (minus). Hostname should not start with minus and should not be longer than 63 characters. If no value provided explicitly, it will be populated with the name of the server",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.All(validation.StringIsNotWhiteSpace, validation.StringLenBetween(1, 63))),
+			},
+			"availability_zone": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringInSlice([]string{"AUTO", "ZONE_1", "ZONE_2"}, true)),
+			},
+			"boot_volume": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"boot_cdrom": {
+				Type:             schema.TypeString,
+				Computed:         true,
+				Optional:         true,
+				Deprecated:       "Please use the 'ionoscloud_server_boot_device_selection' resource for managing the boot device of the server.",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+			},
+			"boot_image": {
+				Type:     schema.TypeString,
+				Computed: true,
+				Optional: true,
+			},
+			"primary_nic": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"primary_ip": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"firewallrule_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+				ForceNew:    true,
+			},
+			"image_password": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				Sensitive:     true,
+				Computed:      true,
+				ConflictsWith: []string{"volume.0.image_password"},
+			},
+			"image_name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+				ForceNew: true,
+			},
+			"ssh_key_path": {
+				Type:          schema.TypeList,
+				Elem:          &schema.Schema{Type: schema.TypeString},
+				ConflictsWith: []string{"volume.0.ssh_key_path"},
+				Optional:      true,
+				Computed:      true,
+			},
+			"security_groups_ids": {
+				Type:        schema.TypeSet,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Optional:    true,
+				Description: "The list of Security Group IDs for the server",
+			},
+			"volume": {
+				Type:     schema.TypeList,
+				Required: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"disk_type": {
+							Type:             schema.TypeString,
+							Required:         true,
+							ForceNew:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+						},
+						"image_password": {
+							Type:          schema.TypeString,
+							Optional:      true,
+							Deprecated:    "Please use image_password under server level",
+							ConflictsWith: []string{"image_password"},
+							DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+								if d.Get("image_password").(string) == new {
+									return true
+								}
+								return false
+							},
+						},
+						"licence_type": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"ssh_key_path": {
+							Type:       schema.TypeList,
+							Elem:       &schema.Schema{Type: schema.TypeString},
+							Optional:   true,
+							Deprecated: "Please use ssh_key_path under server level",
+							Computed:   true,
+							DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+								if k == "volume.0.ssh_key_path.#" {
+									if d.Get("ssh_key_path.#") == new {
+										return true
+									}
+								}
+
+								sshKeyPath := d.Get("volume.0.ssh_key_path").([]any)
+								oldSshKeyPath := d.Get("ssh_key_path").([]any)
+
+								if len(slice.DiffString(slice.AnyToString(sshKeyPath), slice.AnyToString(oldSshKeyPath))) == 0 {
+									return true
+								}
+								return false
+							},
+						},
+						"bus": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"name": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"availability_zone": {
+							Type:             schema.TypeString,
+							Optional:         true,
+							Computed:         true,
+							ForceNew:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(validation.StringInSlice([]string{"AUTO", "ZONE_1", "ZONE_2", "ZONE_3"}, true)),
+						},
+						"cpu_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"ram_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"nic_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"nic_hot_unplug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"disc_virtio_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"disc_virtio_hot_unplug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"device_number": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"backup_unit_id": {
+							Type:        schema.TypeString,
+							Description: "The uuid of the Backup Unit that user has access to. The property is immutable and is only allowed to be set on a new volume creation. It is mandatory to provide either 'public image' or 'imageAlias' in conjunction with this property.",
+							Optional:    true,
+							Computed:    true,
+							ForceNew:    true,
+						},
+						"user_data": {
+							Type:        schema.TypeString,
+							Description: "The cloud-init configuration for the volume as base64 encoded string. The property is immutable and is only allowed to be set on a new volume creation. It is mandatory to provide either 'public image' or 'imageAlias' that has cloud-init compatibility in conjunction with this property.",
+							Optional:    true,
+							Computed:    true,
+							ForceNew:    true,
+						},
+						"pci_slot": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"boot_server": {
+							Type:        schema.TypeString,
+							Description: "The UUID of the attached server.",
+							Computed:    true,
+						},
+						"expose_serial": {
+							Type:     schema.TypeBool,
+							Optional: true,
+							Computed: true,
+							Description: "If set to `true` will expose the serial id of the disk attached to the server. " +
+								"If set to `false` will not expose the serial id. Some operating systems or software solutions require the serial id to be exposed to work properly. " +
+								"Exposing the serial can influence licensed software (e.g. Windows) behavior",
+						},
+						"require_legacy_bios": {
+							Type:        schema.TypeBool,
+							Description: "Indicates if the image requires the legacy BIOS for compatibility or specific needs.",
+							Optional:    true,
+							Computed:    true,
+						},
+					},
+				},
+			},
+			"vm_state": {
+				Type:             schema.TypeString,
+				Optional:         true,
+				Computed:         true,
+				Description:      "Sets the power state of the cube server. Possible values: `RUNNING` or `SUSPENDED`.",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringInSlice([]string{constant.VMStateStart, constant.CubeVMStateStop}, true)),
+			},
+			"nic": {
+				Type:     schema.TypeList,
+				Required: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: serverutil.SchemaNicElemSingleFirewall(),
+				},
+			},
+			"inline_volume_ids": {
+				Type:        schema.TypeList,
+				Description: "A list that contains the IDs for the volumes defined inside the cube server resource.",
+				Computed:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"allow_replace": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "When set to true, allows the update of immutable fields by destroying and re-creating the resource.",
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func resourceCubeServerCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	server := ionoscloud.Server{
+		Properties: &ionoscloud.ServerProperties{},
+	}
+
+	var image, imageAlias string
+
+	dcID := d.Get("datacenter_id").(string)
+
+	serverName := d.Get("name").(string)
+	server.Properties.Name = &serverName
+
+	templateUuid := d.Get("template_uuid").(string)
+	server.Properties.TemplateUuid = &templateUuid
+
+	if v, ok := d.GetOk("availability_zone"); ok {
+		vStr := v.(string)
+		server.Properties.AvailabilityZone = &vStr
+	}
+
+	serverType := constant.CubeType
+	server.Properties.Type = &serverType
+
+	if v, ok := d.GetOk("hostname"); ok {
+		if v.(string) != "" {
+			vStr := v.(string)
+			server.Properties.Hostname = &vStr
+		}
+	}
+
+	if _, ok := d.GetOk("boot_cdrom"); ok {
+		resID := d.Get("boot_cdrom").(string)
+		server.Properties.BootCdrom = &ionoscloud.ResourceReference{
+			Id: &resID,
+		}
+	}
+
+	if _, ok := d.GetOk("boot_volume"); ok {
+		return diagutil.ToDiags(d, fmt.Errorf("boot_volume argument can be set only in update requests"), nil)
+	}
+
+	var volume *ionoscloud.VolumeProperties
+	volume, err = getVolumeData(ctx, d, "volume.0.", constant.CubeType)
+	if err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+	image, imageAlias, err = getImage(ctx, client, d, *volume)
+	if err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	if image != "" {
+		volume.Image = &image
+	} else {
+		volume.Image = nil
+	}
+
+	if imageAlias != "" {
+		volume.ImageAlias = &imageAlias
+	} else {
+		volume.ImageAlias = nil
+	}
+	if backupUnitID, ok := d.GetOk("volume.0.backup_unit_id"); ok {
+		if utils.IsValidUUID(backupUnitID.(string)) {
+			if image == "" && imageAlias == "" {
+				return diagutil.ToDiags(d, fmt.Errorf("it is mandatory to provide either public image or imageAlias in conjunction with backup unit id property"), nil)
+			}
+			backupUnitID := backupUnitID.(string)
+			volume.BackupunitId = &backupUnitID
+		}
+	}
+	if userData, ok := d.GetOk("volume.0.user_data"); ok {
+		if image == "" && imageAlias == "" {
+			return diagutil.ToDiags(d, fmt.Errorf("it is mandatory to provide either public image or imageAlias that has cloud-init compatibility in conjunction with backup unit id property "), nil)
+		}
+		userData := userData.(string)
+		volume.UserData = &userData
+	}
+	server.Entities = &ionoscloud.ServerEntities{
+		Volumes: &ionoscloud.AttachedVolumes{
+			Items: &[]ionoscloud.Volume{
+				{
+					Properties: volume,
+				},
+			},
+		},
+	}
+	var primaryNic *ionoscloud.Nic
+	// Nic Arguments
+	nic := ionoscloud.Nic{
+		Properties: &ionoscloud.NicProperties{},
+	}
+	if _, ok := d.GetOk("nic"); ok {
+		nic, err = cloudapinic.GetNicFromSchemaCreate(d, "nic.0.")
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("cube error occurred while getting nic from schema: %w", err), nil)
+		}
+	}
+
+	server.Entities.Nics = &ionoscloud.Nics{
+		Items: &[]ionoscloud.Nic{
+			nic,
+		},
+	}
+	primaryNic = &(*server.Entities.Nics.Items)[0]
+	tflog.Debug(ctx, "nic dhcp", map[string]any{"nic_dhcp": *nic.Properties.Dhcp, "primary_nic_dhcp": *primaryNic.Properties.Dhcp})
+
+	firewall := ionoscloud.FirewallRule{
+		Properties: &ionoscloud.FirewallruleProperties{},
+	}
+	if _, ok := d.GetOk("nic.0.firewall"); ok {
+		var diags diag.Diagnostics
+		firewall, diags = getFirewallData(d, "nic.0.firewall.0.", false)
+		if diags != nil {
+			return diags
+		}
+		(*server.Entities.Nics.Items)[0].Entities = &ionoscloud.NicEntities{
+			Firewallrules: &ionoscloud.FirewallRules{
+				Items: &[]ionoscloud.FirewallRule{
+					firewall,
+				},
+			},
+		}
+	}
+
+	if primaryNic != nil && primaryNic.Properties != nil && primaryNic.Properties.Ips != nil {
+		if len(*primaryNic.Properties.Ips) == 0 {
+			*primaryNic.Properties.Ips = nil
+		}
+	}
+
+	createdServer, apiResponse, err := client.ServersApi.DatacentersServersPost(ctx, d.Get("datacenter_id").(string)).Server(server).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error creating server: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+	d.SetId(*createdServer.Id)
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+		if bundleclient.IsRequestFailed(errState) {
+			tflog.Debug(ctx, "failed to create cube server resource")
+			d.SetId("")
+		}
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error waiting for state change for server creation %w", errState), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	// get additional data for schema
+	createdServer, apiResponse, err = client.ServersApi.DatacentersServersFindById(ctx, d.Get("datacenter_id").(string), *createdServer.Id).Depth(3).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error fetching server: (%w)", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+	if v, ok := d.GetOk("security_groups_ids"); ok {
+		raw := v.(*schema.Set).List()
+		nsgService := nsg.Service{Client: client, Meta: meta, D: d}
+		if diagnostic := nsgService.PutServerNSG(ctx, dcID, *createdServer.Id, raw); diagnostic != nil {
+			return diagnostic
+		}
+	}
+
+	firewallRules, apiResponse, err := client.FirewallRulesApi.DatacentersServersNicsFirewallrulesGet(ctx, d.Get("datacenter_id").(string),
+		*createdServer.Id, *(*createdServer.Entities.Nics.Items)[0].Id).Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching firewall rules: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if firewallRules.Items != nil {
+		if len(*firewallRules.Items) > 0 {
+			if err := d.Set("firewallrule_id", *(*firewallRules.Items)[0].Id); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+	}
+
+	if (*createdServer.Entities.Nics.Items)[0].Id != nil {
+		primaryNicID := *(*createdServer.Entities.Nics.Items)[0].Id
+		err := d.Set("primary_nic", primaryNicID)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("error while setting primary nic: %w", err), nil)
+		}
+		if v, ok := d.GetOk("nic.0.security_groups_ids"); ok {
+			raw := v.(*schema.Set).List()
+			nsgService := nsg.Service{Client: client, Meta: meta, D: d}
+			if diagnostic := nsgService.PutNICNSG(ctx, dcID, d.Id(), primaryNicID, raw); diagnostic != nil {
+				return diagnostic
+			}
+		}
+	}
+
+	if (*createdServer.Entities.Nics.Items)[0].Properties.Ips != nil &&
+		len(*(*createdServer.Entities.Nics.Items)[0].Properties.Ips) > 0 &&
+		createdServer.Entities.Volumes != nil &&
+		createdServer.Entities.Volumes.Items != nil &&
+		len(*createdServer.Entities.Volumes.Items) > 0 &&
+		(*createdServer.Entities.Volumes.Items)[0].Properties != nil &&
+		(*createdServer.Entities.Volumes.Items)[0].Properties.ImagePassword != nil {
+
+		d.SetConnInfo(map[string]string{
+			"type":     "ssh",
+			"host":     (*(*createdServer.Entities.Nics.Items)[0].Properties.Ips)[0],
+			"password": *(*createdServer.Entities.Volumes.Items)[0].Properties.ImagePassword,
+		})
+	}
+
+	// Set inline volumes
+	if createdServer.Entities.Volumes != nil && createdServer.Entities.Volumes.Items != nil {
+		var inlineVolumeIDs []string
+		for _, volume := range *createdServer.Entities.Volumes.Items {
+			inlineVolumeIDs = append(inlineVolumeIDs, *volume.Id)
+		}
+
+		if err := d.Set("inline_volume_ids", inlineVolumeIDs); err != nil {
+			return diagutil.ToDiags(d, utils.GenerateSetError("server", "inline_volume_ids", err), nil)
+		}
+	}
+
+	if initialState, ok := d.GetOk("vm_state"); ok {
+		ss := cloudapiserver.Service{Client: client, Meta: meta, D: d}
+		initialState := initialState.(string)
+
+		if strings.EqualFold(initialState, constant.CubeVMStateStop) {
+			err := ss.Stop(ctx, dcID, d.Id(), serverType)
+			if err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+	}
+
+	return resourceCubeServerRead(ctx, d, meta)
+}
+
+func resourceCubeServerRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+	serverID := d.Id()
+
+	server, apiResponse, err := client.ServersApi.DatacentersServersFindById(ctx, dcID, serverID).Depth(2).Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		if httpNotFound(apiResponse) {
+			tflog.Debug(ctx, "cannot find cube server by id", map[string]any{"server_id": serverID})
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("error occurred while fetching a server: %w", err), nil)
+	}
+	if server.Properties != nil {
+		if server.Properties.TemplateUuid != nil {
+			if err := d.Set("template_uuid", *server.Properties.TemplateUuid); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		if server.Properties.Name != nil {
+			if err := d.Set("name", *server.Properties.Name); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		if server.Properties.Hostname != nil {
+			if err := d.Set("hostname", *server.Properties.Hostname); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		if server.Properties.AvailabilityZone != nil {
+			if err := d.Set("availability_zone", *server.Properties.AvailabilityZone); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		if server.Properties.VmState != nil {
+			if err := d.Set("vm_state", *server.Properties.VmState); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+	}
+
+	// upgrade from version without inline_volume_ids in Cube server
+	if _, ok := d.GetOk("inline_volume_ids"); !ok {
+		if bootVolume, ok := d.GetOk("boot_volume"); ok {
+			bootVolume := bootVolume.(string)
+			var inlineVolumeIDs []string
+			inlineVolumeIDs = append(inlineVolumeIDs, bootVolume)
+			if err := d.Set("inline_volume_ids", inlineVolumeIDs); err != nil {
+				return diagutil.ToDiags(d, utils.GenerateSetError("cube_server", "inline_volume_ids", err), nil)
+			}
+		}
+	}
+
+	if server.Entities != nil && server.Entities.Securitygroups != nil && server.Entities.Securitygroups.Items != nil {
+		if err := nsg.SetNSGInResourceData(d, server.Entities.Securitygroups.Items); err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+	}
+
+	if server.Entities != nil && server.Entities.Volumes != nil && server.Entities.Volumes.Items != nil && len(*server.Entities.Volumes.Items) > 0 &&
+		(*server.Entities.Volumes.Items)[0].Properties.Image != nil {
+		if err := d.Set("boot_image", *(*server.Entities.Volumes.Items)[0].Properties.Image); err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+	}
+
+	if primarynic, ok := d.GetOk("primary_nic"); ok {
+		if err := d.Set("primary_nic", primarynic.(string)); err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+		ns := cloudapinic.Service{Client: client, Meta: meta, D: d}
+
+		nic, apiResponse, err := ns.Get(ctx, dcID, serverID, primarynic.(string), 0)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("error occurred while fetching nic %s %w", primarynic.(string), err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+
+		if len(*nic.Properties.Ips) > 0 {
+			if err := d.Set("primary_ip", (*nic.Properties.Ips)[0]); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		network := cloudapinic.SetNetworkProperties(*nic)
+
+		if nic.Properties.Ips != nil && len(*nic.Properties.Ips) > 0 {
+			network["ips"] = *nic.Properties.Ips
+		}
+
+		if firewallID, ok := d.GetOk("firewallrule_id"); ok {
+			firewall, apiResponse, err := client.FirewallRulesApi.DatacentersServersNicsFirewallrulesFindById(ctx, dcID, serverID, primarynic.(string), firewallID.(string)).Execute()
+			logApiRequestTime(apiResponse)
+			if err != nil {
+				requestLocation, _ := apiResponse.SafeLocation()
+				return diagutil.ToDiags(d, fmt.Errorf("error occurred while fetching firewallrule %s for server ID %s %w", firewallID.(string), serverID, err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+			}
+
+			fw := cloudapifirewall.SetProperties(firewall)
+
+			network["firewall"] = []map[string]any{fw}
+		}
+
+		networks := []map[string]any{network}
+		if err := d.Set("nic", networks); err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("[ERROR] unable to save nic to state IONOS CLOUD Server (%s): %w", serverID, err), nil)
+		}
+	}
+
+	inlineVolumeIDs := d.Get("inline_volume_ids")
+	if inlineVolumeIDs != nil {
+		inlineVolumeIDs := inlineVolumeIDs.([]any)
+		var volumes []any
+
+		for i, volumeID := range inlineVolumeIDs {
+			volume, apiResponse, err := client.ServersApi.DatacentersServersVolumesFindById(ctx, dcID, d.Id(), volumeID.(string)).Execute()
+			logApiRequestTime(apiResponse)
+			if err != nil {
+				requestLocation, _ := apiResponse.SafeLocation()
+				return diagutil.ToDiags(d, fmt.Errorf("error retrieving inline volume %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+			}
+			volumePath := fmt.Sprintf("volume.%d.", i)
+			entry := serverutil.SetServerVolumeProperties(volume)
+			userData := d.Get(volumePath + "user_data")
+			entry["user_data"] = userData
+			backupUnit := d.Get(volumePath + "backup_unit_id")
+			entry["backup_unit_id"] = backupUnit
+			volumes = append(volumes, entry)
+		}
+		if err := d.Set("volume", volumes); err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("[DEBUG] Error saving inline volumes to state for Cube server: %w", err), nil)
+		}
+	}
+
+	if server.Properties.BootCdrom != nil {
+		if err := d.Set("boot_cdrom", *server.Properties.BootCdrom.Id); err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+	}
+
+	return nil
+}
+
+func resourceCubeServerUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	ss := cloudapiserver.Service{Client: client, Meta: meta, D: d}
+
+	dcID := d.Get("datacenter_id").(string)
+	request := ionoscloud.ServerProperties{}
+
+	currentVmState, err := ss.GetVmState(ctx, dcID, d.Id())
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("could not retrieve server vmState: %w", err), nil)
+	}
+	if strings.EqualFold(currentVmState, constant.CubeVMStateStop) && !d.HasChange("vm_state") {
+		return diagutil.ToDiags(d, fmt.Errorf("cannot update a suspended Cube Server, must change the state to RUNNING first"), nil)
+	}
+
+	// Unsuspend a Cube server first, before applying other changes
+	if d.HasChange("vm_state") &&
+		// and is it suspended / paused ?
+		(strings.EqualFold(currentVmState, constant.CubeVMStateStop) ||
+			strings.EqualFold(currentVmState, constant.GpuVMStateStop)) {
+		err := ss.Start(ctx, dcID, d.Id(), constant.CubeType)
+		if err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+	}
+
+	if d.HasChange("template_uuid") {
+		_, n := d.GetChange("template_uuid")
+		nStr := n.(string)
+		request.TemplateUuid = &nStr
+	}
+	if d.HasChange("name") {
+		_, n := d.GetChange("name")
+		nStr := n.(string)
+		request.Name = &nStr
+	}
+
+	if d.HasChange("hostname") {
+		_, n := d.GetChange("hostname")
+		nStr := n.(string)
+		request.Hostname = &nStr
+	}
+
+	if d.HasChange("boot_cdrom") {
+		_, n := d.GetChange("boot_cdrom")
+		bootCdrom := n.(string)
+
+		if utils.IsValidUUID(bootCdrom) {
+			ss := cloudapiserver.Service{Client: client, Meta: meta, D: d}
+			ss.UpdateBootDevice(ctx, dcID, d.Id(), bootCdrom)
+		}
+	}
+
+	server, apiResponse, err := client.ServersApi.DatacentersServersPatch(ctx, dcID, d.Id()).Server(request).Depth(3).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error occurred while updating server: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutUpdate); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	if d.HasChange("security_groups_ids") {
+		if v, ok := d.GetOk("security_groups_ids"); ok {
+			raw := v.(*schema.Set).List()
+			nsgService := nsg.Service{Client: client, Meta: meta, D: d}
+			if diagnostic := nsgService.PutServerNSG(ctx, dcID, d.Id(), raw); diagnostic != nil {
+				return diagnostic
+			}
+		}
+	}
+
+	// Volume stuff
+	if d.HasChange("volume") {
+		properties := ionoscloud.VolumeProperties{}
+		inlineVolumeIDs := d.Get("inline_volume_ids")
+
+		if inlineVolumeIDs != nil {
+			inlineVolumeIDs := inlineVolumeIDs.([]any)
+			for i, volumeID := range inlineVolumeIDs {
+				volumeIDStr := volumeID.(string)
+				volumePath := fmt.Sprintf("volume.%d.", i)
+				_, apiResponse, err := client.ServersApi.DatacentersServersVolumesFindById(ctx, dcID, d.Id(), volumeIDStr).Execute()
+				logApiRequestTime(apiResponse)
+				if err != nil {
+					requestLocation, _ := apiResponse.SafeLocation()
+					return diagutil.ToDiags(d, fmt.Errorf("an error occurred while getting a volume dcID: %s ID: %s Response: %w", dcID, volumeID, err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+				}
+				if v, ok := d.GetOk(volumePath + "name"); ok {
+					vStr := v.(string)
+					properties.Name = &vStr
+				}
+				if v, ok := d.GetOk(volumePath + "bus"); ok {
+					vStr := v.(string)
+					properties.Bus = &vStr
+				}
+
+				if changed := d.HasChange(volumePath + "expose_serial"); changed {
+					_, newVal := d.GetChange(volumePath + "expose_serial")
+					exposeSerial := newVal.(bool)
+					properties.ExposeSerial = &exposeSerial
+				}
+
+				if d.HasChange(volumePath + "require_legacy_bios") {
+					_, newVal := d.GetChange(volumePath + "require_legacy_bios")
+					requireLegacyBios := newVal.(bool)
+					properties.RequireLegacyBios = &requireLegacyBios
+				}
+
+				_, apiResponse, err = client.VolumesApi.DatacentersVolumesPatch(ctx, d.Get("datacenter_id").(string), volumeIDStr).Volume(properties).Execute()
+				logApiRequestTime(apiResponse)
+
+				if err != nil {
+					requestLocation, _ := apiResponse.SafeLocation()
+					return diagutil.ToDiags(d, fmt.Errorf("error patching volume: (%w)", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+				}
+
+				if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutUpdate); errState != nil {
+					requestLocation, _ := apiResponse.SafeLocation()
+					return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+				}
+			}
+		}
+	}
+
+	// Nic stuff
+	if d.HasChange("nic") {
+		nic := &ionoscloud.Nic{}
+		nicStr := d.Get("primary_nic").(string)
+		for _, n := range *server.Entities.Nics.Items {
+			if *n.Id == nicStr {
+				nic = &n
+				break
+			}
+		}
+
+		lan := int32(d.Get("nic.0.lan").(int))
+		properties := ionoscloud.NicProperties{
+			Lan: &lan,
+		}
+
+		if v, ok := d.GetOk("nic.0.name"); ok {
+			vStr := v.(string)
+			properties.Name = &vStr
+		}
+
+		ips, err := cloudapinic.GetNicIPsFromSchema(d, "nic.0.ips")
+		if err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+		if ips != nil {
+			properties.Ips = &ips
+		}
+
+		ipv6IPs, err := cloudapinic.GetNicIPsFromSchema(d, "nic.0.ipv6_ips")
+		if err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+		if ipv6IPs != nil {
+			properties.Ipv6Ips = &ipv6IPs
+		}
+
+		if v, ok := d.GetOk("nic.0.ipv6_cidr_block"); ok {
+			ipv6Block := v.(string)
+			properties.Ipv6CidrBlock = &ipv6Block
+		}
+
+		if d.HasChange("nic.0.dhcpv6") {
+			// GetOkExists is needed to distinguish unset from explicit false on this *bool;
+			// GetOk treats the zero value (false) as "not set" and would skip SetDhcpv6Nil incorrectly.
+			if dhcpv6, ok := d.GetOkExists("nic.0.dhcpv6"); ok { //nolint:staticcheck // SA1019: GetOkExists has no SDKv2 replacement for tri-state bools
+				dhcpv6 := dhcpv6.(bool)
+				properties.Dhcpv6 = &dhcpv6
+			} else {
+				properties.SetDhcpv6Nil()
+			}
+		}
+
+		dhcp := d.Get("nic.0.dhcp").(bool)
+		fwRule := d.Get("nic.0.firewall_active").(bool)
+		properties.Dhcp = &dhcp
+		properties.FirewallActive = &fwRule
+
+		if v, ok := d.GetOk("nic.0.firewall_type"); ok {
+			vStr := v.(string)
+			properties.FirewallType = &vStr
+		}
+
+		if d.HasChange("nic.0.firewall") {
+
+			firewallID := d.Get("firewallrule_id").(string)
+			update := true
+			if firewallID == "" {
+				update = false
+			}
+
+			firewall, diags := getFirewallData(d, "nic.0.firewall.0.", update)
+			if diags != nil {
+				return diags
+			}
+
+			_, apiResponse, err := client.FirewallRulesApi.DatacentersServersNicsFirewallrulesFindById(ctx, dcID, *server.Id, *nic.Id, firewallID).Execute()
+			logApiRequestTime(apiResponse)
+
+			if err != nil {
+				if !httpNotFound(apiResponse) {
+					return diagutil.ToDiags(d, fmt.Errorf("error occurred at checking existence of firewall %s %w", firewallID, err), nil)
+				} else if httpNotFound(apiResponse) {
+					return diagutil.ToDiags(d, fmt.Errorf("firewall does not exist %s", firewallID), nil)
+				}
+			}
+			if update == false {
+
+				firewall, apiResponse, err = client.FirewallRulesApi.DatacentersServersNicsFirewallrulesPost(ctx, dcID, *server.Id, *nic.Id).Firewallrule(firewall).Execute()
+			} else {
+				firewall, apiResponse, err = client.FirewallRulesApi.DatacentersServersNicsFirewallrulesPatch(ctx, dcID, *server.Id, *nic.Id, firewallID).Firewallrule(*firewall.Properties).Execute()
+
+			}
+			logApiRequestTime(apiResponse)
+			if err != nil {
+				requestLocation, _ := apiResponse.SafeLocation()
+				return diagutil.ToDiags(d, fmt.Errorf("an error occurred while running firewall rule dcID: %s server_id: %s nic_id %s ID: %s Response: %w", dcID, *server.Id, *nic.Id, firewallID, err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+			}
+
+			if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+				requestLocation, _ := apiResponse.SafeLocation()
+				return diagutil.ToDiags(d, fmt.Errorf("on cube update an error occurred while waiting for state change dcID: %s server_id: %s nic_id %s ID: %s Response: %w", dcID, *server.Id, *nic.Id, firewallID, errState), &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+			}
+
+			if firewallID == "" && firewall.Id != nil {
+				if err := d.Set("firewallrule_id", firewall.Id); err != nil {
+					return diagutil.ToDiags(d, err, nil)
+				}
+			}
+
+			nic.Entities = &ionoscloud.NicEntities{
+				Firewallrules: &ionoscloud.FirewallRules{
+					Items: &[]ionoscloud.FirewallRule{
+						firewall,
+					},
+				},
+			}
+
+		}
+		mProp, _ := json.Marshal(properties)
+
+		tflog.Debug(ctx, "updating cube nic properties", map[string]any{"properties": string(mProp)})
+		ns := cloudapinic.Service{Client: client, Meta: meta, D: d}
+		_, apiResponse, err = ns.Update(ctx, d.Get("datacenter_id").(string), *server.Id, *nic.Id, properties)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("error updating nic (%w)", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+
+		if d.HasChange("nic.0.security_groups_ids") {
+			if v, ok := d.GetOk("nic.0.security_groups_ids"); ok {
+				raw := v.(*schema.Set).List()
+				nsgService := nsg.Service{Client: client, Meta: meta, D: d}
+				if diagnostic := nsgService.PutNICNSG(ctx, d.Get("datacenter_id").(string), *server.Id, *nic.Id, raw); diagnostic != nil {
+					return diagnostic
+				}
+			}
+		}
+	}
+
+	// Suspend a Cube server last, after applying other changes
+	if d.HasChange("vm_state") && strings.EqualFold(currentVmState, constant.VMStateStart) {
+		_, newVmState := d.GetChange("vm_state")
+		if strings.EqualFold(newVmState.(string), constant.CubeVMStateStop) ||
+			strings.EqualFold(newVmState.(string), constant.GpuVMStateStop) {
+			err := ss.Stop(ctx, dcID, d.Id(), constant.CubeType)
+			if err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+	}
+
+	return resourceCubeServerRead(ctx, d, meta)
+}
+
+func resourceCubeServerImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	importID := d.Id()
+
+	location, parts := splitImportID(importID, "/")
+
+	if len(parts) < 2 {
+		return nil, diagutil.ToError(d, fmt.Errorf(
+			"invalid import identifier: expected one of <location>:<datacenter-id>/<server-id> "+
+				"or <datacenter-id>/<server-id>, got: %s", importID), nil)
+	}
+
+	if err := validateImportIDParts(parts); err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("failed validating import identifier %q: %w", importID, err), nil)
+	}
+
+	datacenterID := parts[0]
+	serverID := parts[1]
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+
+	server, apiResponse, err := client.ServersApi.DatacentersServersFindById(ctx, datacenterID, serverID).Depth(3).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("unable to find server %q", serverID), nil)
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("error occurred while fetching a server ID %s %w", importID, err), nil)
+	}
+
+	d.SetId(*server.Id)
+
+	firstNicItem := (*server.Entities.Nics.Items)[0]
+	if server.Entities != nil && server.Entities.Nics != nil && firstNicItem.Properties != nil &&
+		firstNicItem.Properties.Ips != nil &&
+		len(*firstNicItem.Properties.Ips) > 0 {
+		tflog.Debug(ctx, "setting primary_ip", map[string]any{"primary_ip": (*firstNicItem.Properties.Ips)[0]})
+		if err := d.Set("primary_ip", (*firstNicItem.Properties.Ips)[0]); err != nil {
+			return nil, diagutil.ToError(d, fmt.Errorf("error while setting primary ip: %w", err), nil)
+		}
+	}
+
+	if server.Entities != nil && server.Entities.Securitygroups != nil && server.Entities.Securitygroups.Items != nil {
+		if err := nsg.SetNSGInResourceData(d, server.Entities.Securitygroups.Items); err != nil {
+			return nil, diagutil.ToError(d, err, nil)
+		}
+	}
+
+	if err := d.Set("datacenter_id", datacenterID); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	if err := d.Set("location", location); err != nil {
+		return nil, err
+	}
+
+	if server.Properties != nil {
+		if server.Properties.Name != nil {
+			if err := d.Set("name", *server.Properties.Name); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting name %w", err), nil)
+			}
+		}
+		if server.Properties.Hostname != nil {
+			if err := d.Set("hostname", *server.Properties.Hostname); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting hostname %w", err), nil)
+			}
+		}
+		if server.Properties.TemplateUuid != nil {
+			if err := d.Set("template_uuid", *server.Properties.TemplateUuid); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting template uuid %w", err), nil)
+			}
+		}
+
+		if server.Properties.AvailabilityZone != nil {
+			if err := d.Set("availability_zone", *server.Properties.AvailabilityZone); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting availability_zone %w", err), nil)
+			}
+		}
+	}
+
+	if server.Entities != nil && server.Entities.Volumes != nil &&
+		len(*server.Entities.Volumes.Items) > 0 &&
+		(*server.Entities.Volumes.Items)[0].Properties.Image != nil {
+		if err := d.Set("boot_image", *(*server.Entities.Volumes.Items)[0].Properties.Image); err != nil {
+			return nil, diagutil.ToError(d, fmt.Errorf("error setting boot_image %w", err), nil)
+		}
+	}
+
+	if server.Entities != nil && server.Entities.Nics != nil && len(*server.Entities.Nics.Items) > 0 && (*server.Entities.Nics.Items)[0].Id != nil {
+		primaryNic := *(*server.Entities.Nics.Items)[0].Id
+		if err := d.Set("primary_nic", primaryNic); err != nil {
+			return nil, diagutil.ToError(d, fmt.Errorf("error setting primary_nic %w", err), nil)
+		}
+		ns := cloudapinic.Service{Client: client, Meta: meta, D: d}
+
+		nic, apiResponse, err := ns.Get(ctx, datacenterID, serverID, primaryNic, 0)
+		if err != nil {
+			return nil, diagutil.ToError(d, err, nil)
+		}
+
+		if len(*nic.Properties.Ips) > 0 {
+			if err := d.Set("primary_ip", (*nic.Properties.Ips)[0]); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting primary_ip %w", err), nil)
+			}
+		}
+
+		network := cloudapinic.SetNetworkProperties(*nic)
+		firewallRules, apiResponse, err := client.FirewallRulesApi.DatacentersServersNicsFirewallrulesGet(ctx, datacenterID, serverID, primaryNic).Execute()
+		logApiRequestTime(apiResponse)
+
+		if err != nil {
+			return nil, diagutil.ToError(d, err, nil)
+		}
+
+		if firewallRules.Items != nil {
+			if len(*firewallRules.Items) > 0 {
+				if err := d.Set("firewallrule_id", *(*firewallRules.Items)[0].Id); err != nil {
+					return nil, diagutil.ToError(d, fmt.Errorf("error setting firewallrule_id %w", err), nil)
+				}
+			}
+		}
+
+		if firewallID, ok := d.GetOk("firewallrule_id"); ok {
+			firewall, apiResponse, err := client.FirewallRulesApi.DatacentersServersNicsFirewallrulesFindById(ctx, datacenterID, serverID, primaryNic, firewallID.(string)).Execute()
+			logApiRequestTime(apiResponse)
+			if err != nil {
+				return nil, diagutil.ToError(d, err, nil)
+			}
+
+			fw := cloudapifirewall.SetProperties(firewall)
+
+			network["firewall"] = []map[string]any{fw}
+		}
+
+		networks := []map[string]any{network}
+		if err := d.Set("nic", networks); err != nil {
+			return nil, diagutil.ToError(d, fmt.Errorf("error setting nic %w", err), nil)
+		}
+	}
+
+	if server.Properties != nil && server.Properties.BootVolume != nil {
+		if server.Properties.BootVolume.Id != nil {
+			if err := d.Set("boot_volume", *server.Properties.BootVolume.Id); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting boot_volume %w", err), nil)
+			}
+		}
+		volumeObj, apiResponse, err := client.ServersApi.DatacentersServersVolumesFindById(ctx, datacenterID, serverID, *server.Properties.BootVolume.Id).Execute()
+		logApiRequestTime(apiResponse)
+		if err == nil {
+			volumeItem := map[string]any{}
+			if volumeObj.Properties != nil {
+				utils.SetPropWithNilCheck(volumeItem, "name", volumeObj.Properties.Name)
+				utils.SetPropWithNilCheck(volumeItem, "disk_type", volumeObj.Properties.Type)
+				utils.SetPropWithNilCheck(volumeItem, "pci_slot", volumeObj.Properties.PciSlot)
+				utils.SetPropWithNilCheck(volumeItem, "licence_type", volumeObj.Properties.LicenceType)
+				utils.SetPropWithNilCheck(volumeItem, "bus", volumeObj.Properties.Bus)
+				utils.SetPropWithNilCheck(volumeItem, "availability_zone", volumeObj.Properties.AvailabilityZone)
+			}
+
+			volumesList := []map[string]any{volumeItem}
+			if err := d.Set("volume", volumesList); err != nil {
+				return nil, diagutil.ToError(d, fmt.Errorf("error setting volume %w", err), nil)
+			}
+		}
+	}
+	if len(parts) > 3 {
+		if err := d.Set("firewallrule_id", parts[3]); err != nil {
+			return nil, diagutil.ToError(d, fmt.Errorf("error setting firewallrule_id %w", err), nil)
+		}
+	}
+	d.SetId(parts[1])
+
+	return []*schema.ResourceData{d}, nil
+}

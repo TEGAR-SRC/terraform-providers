@@ -1,0 +1,230 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceTemplate() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceTemplateRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"cores": {
+				Type:     schema.TypeFloat,
+				Optional: true,
+				Computed: true,
+			},
+			"ram": {
+				Type:     schema.TypeFloat,
+				Optional: true,
+				Computed: true,
+			},
+			"storage_size": {
+				Type:     schema.TypeFloat,
+				Optional: true,
+				Computed: true,
+			},
+			"category": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"gpus": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"count": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"model": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"vendor": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceTemplateRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	templates, apiResponse, err := client.TemplatesApi.TemplatesGet(ctx).Depth(1).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching IONOS CLOUD templates %w ", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	name, nameOk := d.GetOk("name")
+	cores, coresOk := d.GetOk("cores")
+	ram, ramOk := d.GetOk("ram")
+	storageSize, storageSizeOk := d.GetOk("storage_size")
+	category, categoryOk := d.GetOk("category")
+
+	var results []ionoscloud.Template
+
+	if nameOk && templates.Items != nil {
+		for _, tmp := range *templates.Items {
+			if strings.Contains(strings.ToLower(*tmp.Properties.Name), strings.ToLower(name.(string))) {
+				results = append(results, tmp)
+			}
+		}
+	} else if templates.Items != nil {
+		results = *templates.Items
+	}
+
+	if coresOk {
+		cores := float32(cores.(float64))
+		if results != nil {
+			var coresResults []ionoscloud.Template
+			for _, tmp := range results {
+				if tmp.Properties.Cores != nil && *tmp.Properties.Cores == cores {
+					coresResults = append(coresResults, tmp)
+				}
+			}
+			results = coresResults
+		}
+	}
+
+	if ramOk {
+		ram := float32(ram.(float64))
+		if results != nil {
+			var ramResults []ionoscloud.Template
+			for _, tmp := range results {
+				if tmp.Properties.Ram != nil && *tmp.Properties.Ram == ram {
+					ramResults = append(ramResults, tmp)
+				}
+			}
+			results = ramResults
+		}
+	}
+
+	if storageSizeOk {
+		storageSize := float32(storageSize.(float64))
+		if results != nil {
+			var storageSizeResults []ionoscloud.Template
+			for _, tmp := range results {
+				if tmp.Properties != nil && tmp.Properties.StorageSize != nil && *tmp.Properties.StorageSize == storageSize {
+					storageSizeResults = append(storageSizeResults, tmp)
+				}
+			}
+			results = storageSizeResults
+		}
+	}
+
+	if categoryOk {
+		categoryStr := category.(string)
+		if results != nil {
+			var categoryResults []ionoscloud.Template
+			for _, tmp := range results {
+				if tmp.Properties != nil && tmp.Properties.Category != nil && *tmp.Properties.Category == categoryStr {
+					categoryResults = append(categoryResults, tmp)
+				}
+			}
+			results = categoryResults
+		}
+	}
+
+	var template ionoscloud.Template
+
+	if results == nil || len(results) == 0 {
+		return diagutil.ToDiags(d, fmt.Errorf("no template found with the specified criteria: name = %v, cores = %v, ram = %v, storage_size = %v, category = %v", name, cores, ram, storageSize, category), nil)
+	} else if len(results) > 1 {
+		return diagutil.ToDiags(d, fmt.Errorf("more than one template found with the specified criteria: name = %v, cores = %v, ram = %v, storage_size = %v, category = %v", name, cores, ram, storageSize, category), nil)
+	} else {
+		template = results[0]
+	}
+
+	if err = setTemplateData(d, &template); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
+
+func setTemplateData(d *schema.ResourceData, template *ionoscloud.Template) error {
+	d.SetId(*template.Id)
+
+	if template.Properties != nil {
+		if template.Properties.Name != nil {
+			err := d.Set("name", *template.Properties.Name)
+			if err != nil {
+				return fmt.Errorf("error while setting name property for image %s: %w", d.Id(), err)
+			}
+		}
+
+		if template.Properties.Cores != nil {
+			if err := d.Set("cores", *template.Properties.Cores); err != nil {
+				return err
+			}
+		}
+		if template.Properties.Ram != nil {
+			if err := d.Set("ram", *template.Properties.Ram); err != nil {
+				return err
+			}
+		}
+		if template.Properties.StorageSize != nil {
+			if err := d.Set("storage_size", *template.Properties.StorageSize); err != nil {
+				return err
+			}
+		}
+
+		if template.Properties.Category != nil {
+			if err := d.Set("category", *template.Properties.Category); err != nil {
+				return err
+			}
+		}
+
+		if template.Properties.Gpus != nil {
+			var gpus []map[string]any
+			for _, gpu := range *template.Properties.Gpus {
+				gpuMap := map[string]any{
+					"count":  gpu.Count,
+					"model":  gpu.Model,
+					"type":   gpu.Type,
+					"vendor": gpu.Vendor,
+				}
+				gpus = append(gpus, gpuMap)
+			}
+			if err := d.Set("gpus", gpus); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

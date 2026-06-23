@@ -1,0 +1,419 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func resourceNatGateway() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceNatGatewayCreate,
+		ReadContext:   resourceNatGatewayRead,
+		UpdateContext: resourceNatGatewayUpdate,
+		DeleteContext: resourceNatGatewayDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceNatGatewayImport,
+		},
+		Schema: map[string]*schema.Schema{
+			"name": {
+				Type:             schema.TypeString,
+				Description:      "Name of the NAT gateway",
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"public_ips": {
+				Type:        schema.TypeSet,
+				Description: "Collection of public IP addresses of the NAT gateway. Should be customer reserved IP addresses in that location",
+				Required:    true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"lans": {
+				Type:        schema.TypeList,
+				Description: "A list of Local Area Networks the node pool should be part of",
+				Required:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"id": {
+							Type:        schema.TypeInt,
+							Description: "Id for the LAN connected to the NAT gateway",
+							Required:    true,
+						},
+						"gateway_ips": {
+							Type: schema.TypeList,
+							Description: "Collection of gateway IP addresses of the NAT gateway. Will be auto-generated " +
+								"if not provided. Should ideally be an IP belonging to the same subnet as the LAN",
+							Optional: true,
+							Computed: true,
+							Elem: &schema.Schema{
+								Type: schema.TypeString,
+							},
+							DiffSuppressFunc: DiffCidr,
+						},
+					},
+				},
+			},
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ForceNew:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+				ForceNew:    true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func resourceNatGatewayCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	name := d.Get("name").(string)
+
+	natGateway := ionoscloud.NatGateway{
+		Properties: &ionoscloud.NatGatewayProperties{
+			Name: &name,
+		},
+	}
+
+	if publicIpsVal, publicIpsOk := d.GetOk("public_ips"); publicIpsOk {
+		publicIpsVal := publicIpsVal.(*schema.Set).List()
+		if publicIpsVal != nil {
+			publicIps := make([]string, 0)
+			for _, publicIp := range publicIpsVal {
+				publicIps = append(publicIps, publicIp.(string))
+			}
+			natGateway.Properties.PublicIps = &publicIps
+		} else {
+			return diagutil.ToDiags(d, fmt.Errorf("you must provide public_ips for nat gateway resource"), nil)
+		}
+	}
+
+	if lansVal, lansOK := d.GetOk("lans"); lansOK {
+		if lansVal.([]any) != nil {
+			updateLans := false
+			var lans []ionoscloud.NatGatewayLanProperties
+
+			for lanIndex := range lansVal.([]any) {
+				lan := ionoscloud.NatGatewayLanProperties{}
+				addLan := false
+				if lanID, lanIDOk := d.GetOk(fmt.Sprintf("lans.%d.id", lanIndex)); lanIDOk {
+					lanID := int32(lanID.(int))
+					lan.Id = &lanID
+					addLan = true
+				}
+				if lanGatewayIps, lanGatewayIpsOk := d.GetOk(fmt.Sprintf("lans.%d.gateway_ips", lanIndex)); lanGatewayIpsOk {
+					lanGatewayIps := lanGatewayIps.([]any)
+					if lanGatewayIps != nil {
+						gatewayIps := make([]string, len(lanGatewayIps), len(lanGatewayIps))
+						for idx := range lanGatewayIps {
+							gatewayIps[idx] = fmt.Sprint(lanGatewayIps[idx])
+						}
+						lan.GatewayIps = &gatewayIps
+					}
+				}
+				if addLan {
+					lans = append(lans, lan)
+				}
+			}
+
+			if len(lans) > 0 {
+				updateLans = true
+			}
+
+			if updateLans == true {
+				tflog.Info(ctx, "setting NatGateway LANs", map[string]any{"lan_count": len(lans)})
+				natGateway.Properties.Lans = &lans
+			} else {
+				return diagutil.ToDiags(d, fmt.Errorf("you must provide lans for the nat gateway resource"), nil)
+			}
+		}
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	tflog.Debug(ctx, "creating nat gateway", map[string]any{"datacenter_id": dcID})
+	natGatewayResp, apiResponse, err := client.NATGatewaysApi.DatacentersNatgatewaysPost(ctx, dcID).NatGateway(natGateway).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		d.SetId("")
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("error creating natGateway: %w, %s", err, responseBody(apiResponse)), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	d.SetId(*natGatewayResp.Id)
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+		if bundleclient.IsRequestFailed(errState) {
+			d.SetId("")
+		}
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	return resourceNatGatewayRead(ctx, d, meta)
+}
+
+func resourceNatGatewayRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	natGateway, apiResponse, err := client.NATGatewaysApi.DatacentersNatgatewaysFindByNatGatewayId(ctx, dcID, d.Id()).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		tflog.Info(ctx, "nat gateway not found", map[string]any{"nat_gateway_id": d.Id(), "error": err.Error()})
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil
+		}
+	}
+
+	tflog.Info(ctx, "retrieved nat gateway", map[string]any{"nat_gateway_id": d.Id()})
+
+	if err := setNatGatewayData(d, &natGateway); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
+
+func resourceNatGatewayUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	request := ionoscloud.NatGateway{
+		Properties: &ionoscloud.NatGatewayProperties{},
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	if d.HasChange("name") {
+		_, v := d.GetChange("name")
+		vStr := v.(string)
+		request.Properties.Name = &vStr
+	}
+
+	if d.HasChange("public_ips") {
+		oldPublicIps, newPublicIps := d.GetChange("public_ips")
+		tflog.Info(ctx, "nat gateway public IPs changed", map[string]any{"old": oldPublicIps, "new": newPublicIps})
+		publicIpsVal := newPublicIps.(*schema.Set).List()
+		if publicIpsVal != nil {
+			publicIps := make([]string, 0)
+			for _, publicIp := range publicIpsVal {
+				publicIps = append(publicIps, publicIp.(string))
+			}
+			request.Properties.PublicIps = &publicIps
+		}
+	}
+
+	if d.HasChange("lans") {
+		oldLANs, newLANs := d.GetChange("lans")
+		if newLANs.([]any) != nil {
+			updateLans := false
+			var lans []ionoscloud.NatGatewayLanProperties
+
+			for lanIndex := range newLANs.([]any) {
+				lan := ionoscloud.NatGatewayLanProperties{}
+				addLan := false
+				if lanID, lanIDOk := d.GetOk(fmt.Sprintf("lans.%d.id", lanIndex)); lanIDOk {
+					lanID := int32(lanID.(int))
+					lan.Id = &lanID
+					addLan = true
+				}
+				if lanGatewayIps, lanGatewayIpsOk := d.GetOk(fmt.Sprintf("lans.%d.gateway_ips", lanIndex)); lanGatewayIpsOk {
+					lanGatewayIps := lanGatewayIps.([]any)
+					if lanGatewayIps != nil {
+						gatewayIps := make([]string, 0)
+						for _, lanGatewayIp := range lanGatewayIps {
+							gatewayIps = append(gatewayIps, lanGatewayIp.(string))
+						}
+						lan.GatewayIps = &gatewayIps
+					}
+				}
+				if addLan {
+					lans = append(lans, lan)
+				}
+			}
+
+			if len(lans) > 0 {
+				updateLans = true
+			}
+
+			if updateLans == true {
+				tflog.Info(ctx, "nat gateway LANs changed", map[string]any{"old": oldLANs, "new": newLANs})
+				request.Properties.Lans = &lans
+			}
+		}
+	}
+
+	_, apiResponse, err := client.NATGatewaysApi.DatacentersNatgatewaysPatch(ctx, dcID, d.Id()).NatGatewayProperties(*request.Properties).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while updating a nat gateway: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutUpdate); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	return resourceNatGatewayRead(ctx, d, meta)
+}
+
+func resourceNatGatewayDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	dcID := d.Get("datacenter_id").(string)
+
+	apiResponse, err := client.NATGatewaysApi.DatacentersNatgatewaysDelete(ctx, dcID, d.Id()).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while deleting a nat gateway: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutDelete); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	d.SetId("")
+
+	return nil
+}
+
+func resourceNatGatewayImport(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	importID := d.Id()
+
+	location, parts := splitImportID(importID, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf(
+			"invalid import identifier: expected one of <location>:<datacenter-id>/<nat-id> "+
+				"or <datacenter-id>/<nat-id>, got: %s", importID,
+		)
+	}
+
+	if err := validateImportIDParts(parts); err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("failed validating import identifier %q: %w", importID, err), nil)
+	}
+
+	dcID := parts[0]
+	natGatewayID := parts[1]
+
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return nil, err
+	}
+
+	natGateway, apiResponse, err := client.NATGatewaysApi.DatacentersNatgatewaysFindByNatGatewayId(ctx, dcID, natGatewayID).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		tflog.Info(ctx, "nat gateway not found on import", map[string]any{"nat_gateway_id": natGatewayID, "error": err.Error()})
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("unable to find nat gateway  %q", natGatewayID), nil)
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("an error occurred while retrieving nat gateway  %q: %w ", natGatewayID, err), nil)
+	}
+
+	if err := d.Set("datacenter_id", dcID); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+	if err := d.Set("location", location); err != nil {
+		return nil, err
+	}
+
+	if err := setNatGatewayData(d, &natGateway); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+
+	return []*schema.ResourceData{d}, nil
+}
+
+func setNatGatewayData(d *schema.ResourceData, natGateway *ionoscloud.NatGateway) error {
+
+	if natGateway.Id != nil {
+		d.SetId(*natGateway.Id)
+	}
+
+	if natGateway.Properties != nil {
+		if natGateway.Properties.Name != nil {
+			err := d.Set("name", *natGateway.Properties.Name)
+			if err != nil {
+				return fmt.Errorf("error while setting name property for nat gateway %s: %w", d.Id(), err)
+			}
+		}
+
+		if natGateway.Properties.PublicIps != nil {
+			err := d.Set("public_ips", *natGateway.Properties.PublicIps)
+			if err != nil {
+				return fmt.Errorf("error while setting public_ips property for nat gateway %s: %w", d.Id(), err)
+			}
+		}
+
+		if natGateway.Properties.Lans != nil && len(*natGateway.Properties.Lans) > 0 {
+			var natGatewayLans []any
+			for _, lan := range *natGateway.Properties.Lans {
+				lanEntry := make(map[string]any)
+
+				if lan.Id != nil {
+					lanEntry["id"] = *lan.Id
+				}
+
+				if len(*lan.GatewayIps) > 0 {
+					var gatewayIps []any
+					for _, gatewayIp := range *lan.GatewayIps {
+						gatewayIps = append(gatewayIps, gatewayIp)
+					}
+					lanEntry["gateway_ips"] = gatewayIps
+
+				}
+
+				natGatewayLans = append(natGatewayLans, lanEntry)
+			}
+
+			if len(natGatewayLans) > 0 {
+				if err := d.Set("lans", natGatewayLans); err != nil {
+					return fmt.Errorf("error while setting lans property for nat gateway %s: %w", d.Id(), err)
+				}
+			}
+		}
+	}
+	return nil
+}

@@ -1,0 +1,32 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package version
+
+import "github.com/hashicorp/go-version"
+
+// MinimumProxmoxVersion is the minimum supported Proxmox version by the provider.
+//
+//nolint:gochecknoglobals
+var MinimumProxmoxVersion = ProxmoxVersion{*version.Must(version.NewVersion("8.0.0"))}
+
+// SupportImportContentType checks if the Proxmox version supports the `import` content type when uploading disk images.
+// See https://bugzilla.proxmox.com/show_bug.cgi?id=2424
+func (v *ProxmoxVersion) SupportImportContentType() bool {
+	return v.GreaterThanOrEqual(version.Must(version.NewVersion("8.4.0")))
+}
+
+// SupportModernAptSources checks if the Proxmox version uses the modern DEB822 format (.sources) for APT repositories.
+// PVE 9.0 and above use the new .sources format instead of the legacy .list format.
+func (v *ProxmoxVersion) SupportModernAptSources() bool {
+	return v.GreaterThanOrEqual(version.Must(version.NewVersion("9.0.0")))
+}
+
+// SupportContainerHostManaged checks if the Proxmox version supports the `host-managed` flag on LXC network interfaces.
+// PVE 9.1+ accepts the flag; older releases reject the unknown sub-key.
+func (v *ProxmoxVersion) SupportContainerHostManaged() bool {
+	return v.GreaterThanOrEqual(version.Must(version.NewVersion("9.1.0")))
+}

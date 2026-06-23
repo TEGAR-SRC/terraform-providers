@@ -1,0 +1,25 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_load_balancer_network" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  load_balancer_id         = {{ .LoadBalancerID }}
+  {{- if .NetworkID }}
+  network_id               = {{ .NetworkID }}
+  {{ end }}
+  {{- if .SubNetID }}
+  subnet_id                = {{ .SubNetID }}
+  {{ end }}
+
+  {{- /* Optional properties */}}
+  {{- if .IP }}
+  ip                       = "{{ .IP }}"
+  {{ end }}
+
+  {{- if .EnablePublicInterface }}
+  enable_public_interface  = {{ .EnablePublicInterface }}
+  {{ end }}
+
+  {{- if .DependsOn }}
+  depends_on               = [{{ .DependsOn | join ", " }}]
+  {{ end }}
+}

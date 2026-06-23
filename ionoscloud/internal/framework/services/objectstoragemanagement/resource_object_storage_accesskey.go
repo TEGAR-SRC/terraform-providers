@@ -1,0 +1,259 @@
+package objectstoragemanagement
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+
+	objstoragesdk "github.com/ionos-cloud/sdk-go-bundle/products/objectstoragemanagement/v2"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/internal/framework/identity"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	objstorageservice "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/objectstoragemanagement"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+var (
+	_ resource.ResourceWithImportState = (*accesskeyResource)(nil)
+	_ resource.ResourceWithConfigure   = (*accesskeyResource)(nil)
+	_ resource.ResourceWithIdentity    = (*accesskeyResource)(nil)
+)
+
+// IdentitySchema returns the identity schema for the accesskey resource.
+func (r *accesskeyResource) IdentitySchema(_ context.Context, _ resource.IdentitySchemaRequest, resp *resource.IdentitySchemaResponse) {
+	resp.IdentitySchema = identityschema.Schema{
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+		},
+	}
+}
+
+// NewAccesskeyResource creates a new resource for the accesskey resource.
+func NewAccesskeyResource() resource.Resource {
+	return &accesskeyResource{}
+}
+
+type accesskeyResource struct {
+	client *objstorageservice.Client
+}
+
+// Metadata returns the metadata for the accesskey resource.
+func (r *accesskeyResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_object_storage_accesskey"
+}
+
+// Schema returns the schema for the accesskey resource.
+func (r *accesskeyResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				Computed:    true,
+				Description: "The ID (UUID) of the AccessKey.",
+			},
+			"description": schema.StringAttribute{
+				Description: "Description of the Access key.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"accesskey": schema.StringAttribute{
+				Description: "Access key metadata is a string of 92 characters.",
+				Computed:    true,
+			},
+			"secretkey": schema.StringAttribute{
+				Description: "The secret key of the Access key.",
+				Computed:    true,
+			},
+			"canonical_user_id": schema.StringAttribute{
+				Description: "The canonical user ID which is valid for user-owned buckets.",
+				Computed:    true,
+			},
+			"contract_user_id": schema.StringAttribute{
+				Description: "The contract user ID which is valid for contract-owned buckets",
+				Computed:    true,
+			},
+		},
+		Blocks: map[string]schema.Block{
+			"timeouts": timeouts.Block(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Delete: true,
+			}),
+		},
+	}
+}
+
+// Configure configures the accesskey resource.
+func (r *accesskeyResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	clientBundle, ok := req.ProviderData.(*bundleclient.SdkBundle)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Data Source Configure Type",
+			fmt.Sprintf("Expected *services.SdkBundle, got: %T. Please report this issue to the provider developers.", req.ProviderData),
+		)
+
+		return
+	}
+
+	var err error
+	r.client, err = clientBundle.NewObjectStorageManagementClient(ctx)
+	if err != nil {
+		resp.Diagnostics.AddError("initialization error for Object Storage Management client", err.Error())
+	}
+}
+
+// Create creates the accesskey.
+func (r *accesskeyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("object storage management api client not configured", "The provider client is not configured")
+		return
+	}
+
+	var data *objstorageservice.AccesskeyResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	createTimeout, diags := data.Timeouts.Create(ctx, utils.DefaultTimeout)
+	resp.Diagnostics.Append(diags...)
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
+	var accessKey = objstoragesdk.AccessKeyCreate{
+		Properties: objstoragesdk.AccessKey{
+			Description: data.Description.ValueString(),
+		},
+	}
+	accessKeyResponse, apiResponse, err := r.client.CreateAccessKey(ctx, accessKey, createTimeout)
+	if err != nil {
+		resp.Diagnostics.AddError("failed to create accessKey", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceName: data.Description.ValueString(), StatusCode: apiResponse.SafeStatusCode()}).Error())
+		return
+	}
+	// we need this because secretkey is only available on create response
+	objstorageservice.SetAccessKeyPropertiesToPlan(data, accessKeyResponse)
+
+	accessKeyRead, apiResponse, err := r.client.GetAccessKey(ctx, data.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("access Key API error", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceID: data.ID.ValueString(), StatusCode: apiResponse.SafeStatusCode()}).Error())
+		return
+	}
+
+	// we need this because canonical_user_id not available on create response
+	objstorageservice.SetAccessKeyPropertiesToPlan(data, accessKeyRead)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &identity.Model{ID: data.ID})...)
+}
+
+// Read reads the accesskey.
+func (r *accesskeyResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("object storage management api client not configured", "The provider client is not configured")
+		return
+	}
+
+	var data objstorageservice.AccesskeyResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	accessKey, apiResponse, err := r.client.GetAccessKey(ctx, data.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("read Access Key API error", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceID: data.ID.ValueString()}).Error())
+		return
+	}
+	if apiResponse.HttpNotFound() {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	objstorageservice.SetAccessKeyPropertiesToPlan(&data, accessKey)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &identity.Model{ID: data.ID})...)
+}
+
+// ImportState imports the state of the accessKey.
+func (r *accesskeyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughWithIdentity(ctx, path.Root("id"), path.Root("id"), req, resp)
+}
+
+// Update updates the accesskey.
+func (r *accesskeyResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state *objstorageservice.AccesskeyResourceModel
+
+	// Read Terraform plan data into the model
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	updateTimeout, diags := plan.Timeouts.Update(ctx, utils.DefaultTimeout)
+	resp.Diagnostics.Append(diags...)
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
+	var accessKey = objstoragesdk.AccessKeyEnsure{
+		Properties: objstoragesdk.AccessKey{
+			Description: plan.Description.ValueString(),
+		},
+	}
+
+	accessKeyResponse, apiResponse, err := r.client.UpdateAccessKey(ctx, state.ID.ValueString(), accessKey, updateTimeout)
+	if err != nil {
+		resp.Diagnostics.AddError("failed to update accessKey", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceID: state.ID.ValueString(), StatusCode: apiResponse.SafeStatusCode()}).Error())
+		return
+	}
+
+	plan.ID = basetypes.NewStringValue(accessKeyResponse.Id)
+
+	accessKeyRead, apiResponse, err := r.client.GetAccessKey(ctx, accessKeyResponse.Id)
+	if err != nil {
+		resp.Diagnostics.AddError("on update, read access Key API error", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceID: accessKeyResponse.Id, StatusCode: apiResponse.SafeStatusCode()}).Error())
+		return
+	}
+
+	objstorageservice.SetAccessKeyPropertiesToPlan(state, accessKeyRead)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &identity.Model{ID: state.ID})...)
+}
+
+// Delete deletes the accessKey.
+func (r *accesskeyResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("object storage management api client not configured", "The provider client is not configured")
+		return
+	}
+
+	var data *objstorageservice.AccesskeyResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	deleteTimeout, diags := data.Timeouts.Delete(ctx, utils.DefaultTimeout)
+	if diags.HasError() {
+		resp.Diagnostics.Append(diags...)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+
+	if _, err := r.client.DeleteAccessKey(ctx, data.ID.ValueString(), deleteTimeout); err != nil {
+		resp.Diagnostics.AddError("failed to delete accesskey", diagutil.WrapError(err, &diagutil.ErrorContext{ResourceID: data.ID.ValueString()}).Error())
+		return
+	}
+}

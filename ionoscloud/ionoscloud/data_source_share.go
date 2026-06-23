@@ -1,0 +1,73 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceShare() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceShareRead,
+		Schema: map[string]*schema.Schema{
+			"group_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+			},
+			"resource_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"edit_privilege": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+			"share_privilege": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+			"id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceShareRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	groupID := d.Get("group_id").(string)
+	resourceID := d.Get("resource_id").(string)
+	rsp, apiResponse, err := client.UserManagementApi.UmGroupsSharesFindByResourceId(ctx, groupID, resourceID).Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		if httpNotFound(apiResponse) {
+			return diagutil.ToDiags(d, fmt.Errorf("group_id %s resource_id %s not found", groupID, resourceID), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching a share with group_id %s resource_id %s %w", groupID, resourceID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+	}
+	if rsp.Properties == nil {
+		return diagutil.ToDiags(d, fmt.Errorf("no properties found in the response"), nil)
+	}
+	d.SetId(*rsp.Id)
+	if err := d.Set("edit_privilege", *rsp.Properties.EditPrivilege); err != nil {
+		return diagutil.ToDiags(d, utils.GenerateSetError("share", "edit_privilege", err), nil)
+	}
+	if err := d.Set("share_privilege", *rsp.Properties.SharePrivilege); err != nil {
+		return diagutil.ToDiags(d, utils.GenerateSetError("share", "share_privilege", err), nil)
+	}
+	return nil
+}

@@ -1,0 +1,868 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/slice"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils"
+)
+
+func resourceGroup() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceGroupCreate,
+		ReadContext:   resourceGroupRead,
+		UpdateContext: resourceGroupUpdate,
+		DeleteContext: resourceGroupDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: resourceGroupImporter,
+		},
+		Schema:        groupResourceSchema(),
+		CustomizeDiff: customGroupDiff,
+		Timeouts:      &resourceDefaultTimeouts,
+		SchemaVersion: 2,
+		StateUpgraders: []schema.StateUpgrader{
+			// Ensures a smooth upgrade (the user doesn't see any plan changes) from the schema version
+			// that didn't contain 'get_users_data' attribute.
+			{
+				Version: 1,
+				Upgrade: groupStateUpgrader,
+				Type:    groupResourceSchemaV1().CoreConfigSchema().ImpliedType(),
+			},
+		},
+	}
+}
+
+// groupResourceSchema returns the current schema for the group resource
+func groupResourceSchema() map[string]*schema.Schema {
+	return map[string]*schema.Schema{
+		"name": {
+			Type:             schema.TypeString,
+			Required:         true,
+			ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+		},
+		"create_datacenter": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"create_snapshot": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"reserve_ip": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"access_activity_log": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"create_pcc": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"s3_privilege": {
+			Type:     schema.TypeBool,
+			Optional: true,
+		},
+		"create_backup_unit": {
+			Type:        schema.TypeBool,
+			Description: "Create backup unit privilege.",
+			Optional:    true,
+		},
+		"create_internet_access": {
+			Type:        schema.TypeBool,
+			Description: "Create internet access privilege.",
+			Optional:    true,
+		},
+		"create_k8s_cluster": {
+			Type:        schema.TypeBool,
+			Description: "Create Kubernetes cluster privilege.",
+			Optional:    true,
+		},
+		"create_flow_log": {
+			Type:        schema.TypeBool,
+			Description: "Create Flow Logs privilege.",
+			Optional:    true,
+		},
+		"access_and_manage_monitoring": {
+			Type: schema.TypeBool,
+			Description: "Privilege for a group to access and manage monitoring related functionality " +
+				"(access metrics, CRUD on alarms, alarm-actions etc) using Monotoring-as-a-Service (MaaS).",
+			Optional: true,
+		},
+		"access_and_manage_certificates": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage certificates.",
+			Optional:    true,
+		},
+		"manage_dbaas": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to manage DBaaS related functionality",
+			Optional:    true,
+		},
+		"access_and_manage_dns": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage dns records.",
+			Optional:    true,
+		},
+		"manage_registry": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for group accessing container registry related functionality.",
+			Optional:    true,
+		},
+		"manage_dataplatform": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage the Data Platform.",
+			Optional:    true,
+		},
+		"access_and_manage_logging": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage logging.",
+			Optional:    true,
+		},
+		"access_and_manage_cdn": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage Cdn.",
+			Optional:    true,
+		},
+		"access_and_manage_vpn": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage Vpn.",
+			Optional:    true,
+		},
+		"access_and_manage_api_gateway": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage ApiGateway.",
+			Optional:    true,
+		},
+		"access_and_manage_kaas": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage Kaas.",
+			Optional:    true,
+		},
+		"access_and_manage_network_file_storage": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage NetworkFileStorage.",
+			Optional:    true,
+		},
+		"access_and_manage_ai_model_hub": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage AiModelHub.",
+			Optional:    true,
+		},
+		"access_and_manage_iam_resources": {
+			Type:        schema.TypeBool,
+			Description: "Privilege for a group to access and manage IamResources.",
+			Optional:    true,
+		},
+		"create_network_security_groups": {
+			Type:        schema.TypeBool,
+			Description: "Create Network Security groups.",
+			Optional:    true,
+		},
+		"user_id": {
+			Type:          schema.TypeString,
+			Optional:      true,
+			ConflictsWith: []string{"user_ids"},
+			Deprecated:    "Please use user_ids for adding users to the group, since user_id will be removed in the future",
+		},
+		"user_ids": {
+			Type:     schema.TypeSet,
+			Optional: true,
+			Elem: &schema.Schema{
+				Type: schema.TypeString,
+			},
+			ConflictsWith: []string{"user_id"},
+		},
+		"get_users_data": {
+			Type:        schema.TypeBool,
+			Optional:    true,
+			Default:     constant.DefaultGetUsersData,
+			Description: "When set to true, information about users will be stored in state",
+		},
+		"users": {
+			Type:     schema.TypeSet,
+			Computed: true,
+			Elem: &schema.Resource{
+				Schema: map[string]*schema.Schema{
+					"id": {
+						Type:     schema.TypeString,
+						Computed: true,
+					},
+					"first_name": {
+						Type:     schema.TypeString,
+						Computed: true,
+					},
+					"last_name": {
+						Type:     schema.TypeString,
+						Computed: true,
+					},
+					"email": {
+						Type:     schema.TypeString,
+						Computed: true,
+					},
+					"administrator": {
+						Type:     schema.TypeBool,
+						Computed: true,
+					},
+					"force_sec_auth": {
+						Type:     schema.TypeBool,
+						Computed: true,
+					},
+				},
+			},
+		},
+	}
+}
+
+// groupResourceSchemaV1 describes how the schema was looking before adding 'get_users_data' attribute.
+func groupResourceSchemaV1() *schema.Resource {
+	schemaMap := groupResourceSchema()
+	delete(schemaMap, "get_users_data")
+	return &schema.Resource{
+		Schema: schemaMap,
+	}
+}
+
+// groupStateUpgrader sets the default value in the state to ensure a smooth version transition.
+func groupStateUpgrader(ctx context.Context, rawState map[string]any, meta any) (map[string]any, error) {
+	rawState["get_users_data"] = constant.DefaultGetUsersData
+	return rawState, nil
+}
+
+func resourceGroupCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	request := ionoscloud.Group{
+		Properties: &ionoscloud.GroupProperties{},
+	}
+
+	groupName := d.Get("name").(string)
+	if d.Get("name") != nil {
+		request.Properties.Name = &groupName
+	}
+
+	tempCreateDataCenter := d.Get("create_datacenter").(bool)
+	request.Properties.CreateDataCenter = &tempCreateDataCenter
+	tempCreateSnapshot := d.Get("create_snapshot").(bool)
+	request.Properties.CreateSnapshot = &tempCreateSnapshot
+	tempReserveIp := d.Get("reserve_ip").(bool)
+	request.Properties.ReserveIp = &tempReserveIp
+	tempAccessActivityLog := d.Get("access_activity_log").(bool)
+	request.Properties.AccessActivityLog = &tempAccessActivityLog
+	tempCreatePcc := d.Get("create_pcc").(bool)
+	request.Properties.CreatePcc = &tempCreatePcc
+	tempS3Privilege := d.Get("s3_privilege").(bool)
+	request.Properties.S3Privilege = &tempS3Privilege
+	tempCreateBackupUnit := d.Get("create_backup_unit").(bool)
+	request.Properties.CreateBackupUnit = &tempCreateBackupUnit
+	tempCreateInternetAccess := d.Get("create_internet_access").(bool)
+	request.Properties.CreateInternetAccess = &tempCreateInternetAccess
+	tempCreateK8sCluster := d.Get("create_k8s_cluster").(bool)
+	request.Properties.CreateK8sCluster = &tempCreateK8sCluster
+	tempCreateFlowLog := d.Get("create_flow_log").(bool)
+	request.Properties.CreateFlowLog = &tempCreateFlowLog
+	tempCreateNetworkSecurityGroups := d.Get("create_network_security_groups").(bool)
+	request.Properties.CreateNetworkSecurityGroups = &tempCreateNetworkSecurityGroups
+	tempAccessAndManageMonitoring := d.Get("access_and_manage_monitoring").(bool)
+	request.Properties.AccessAndManageMonitoring = &tempAccessAndManageMonitoring
+	tempAccessAndManageCertificates := d.Get("access_and_manage_certificates").(bool)
+	manageDbaas := d.Get("manage_dbaas").(bool)
+	request.Properties.AccessAndManageCertificates = &tempAccessAndManageCertificates
+	request.Properties.ManageDBaaS = &manageDbaas
+	accessAndManageDns := d.Get("access_and_manage_dns").(bool)
+	request.Properties.AccessAndManageDns = &accessAndManageDns
+	manageRegistry := d.Get("manage_registry").(bool)
+	request.Properties.ManageRegistry = &manageRegistry
+	manageDataplatform := d.Get("manage_dataplatform").(bool)
+	request.Properties.ManageDataplatform = &manageDataplatform
+	tempAccessAndManageLogging := d.Get("access_and_manage_logging").(bool)
+	request.Properties.AccessAndManageLogging = &tempAccessAndManageLogging
+	tempAccessAndManageCdn := d.Get("access_and_manage_cdn").(bool)
+	request.Properties.AccessAndManageCdn = &tempAccessAndManageCdn
+	tempAccessAndManageVpn := d.Get("access_and_manage_vpn").(bool)
+	request.Properties.AccessAndManageVpn = &tempAccessAndManageVpn
+	tempAccessAndManageApiGateway := d.Get("access_and_manage_api_gateway").(bool)
+	request.Properties.AccessAndManageApiGateway = &tempAccessAndManageApiGateway
+	tempAccessAndManageKaas := d.Get("access_and_manage_kaas").(bool)
+	request.Properties.AccessAndManageKaas = &tempAccessAndManageKaas
+	tempAccessAndManageNetworkFileStorage := d.Get("access_and_manage_network_file_storage").(bool)
+	request.Properties.AccessAndManageNetworkFileStorage = &tempAccessAndManageNetworkFileStorage
+	tempAccessAndManageAiModelHub := d.Get("access_and_manage_ai_model_hub").(bool)
+	request.Properties.AccessAndManageAiModelHub = &tempAccessAndManageAiModelHub
+	tempAccessAndManageIamResources := d.Get("access_and_manage_iam_resources").(bool)
+	request.Properties.AccessAndManageIamResources = &tempAccessAndManageIamResources
+	group, apiResponse, err := client.UserManagementApi.UmGroupsPost(ctx).Group(request).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while creating a group: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	tflog.Debug(ctx, "group created", map[string]any{"group_id": *group.Id})
+
+	d.SetId(*group.Id)
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+		if bundleclient.IsRequestFailed(errState) {
+			d.SetId("")
+		}
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutCreate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	// add users to group if any is provided
+	if userVal, userOK := d.GetOk("user_id"); userOK {
+		userID := userVal.(string)
+		tflog.Info(ctx, "adding user to group", map[string]any{"user_id": userID, "group_id": d.Id()})
+		if err := addUserToGroup(userID, d.Id(), ctx, d, meta); err != nil {
+			return diagutil.ToDiags(d, err, nil)
+		}
+	}
+
+	if usersVal, usersOK := d.GetOk("user_ids"); usersOK {
+		usersList := usersVal.(*schema.Set)
+		if usersList.List() != nil {
+			for _, userItem := range usersList.List() {
+				userID := userItem.(string)
+				tflog.Info(ctx, "adding user to group", map[string]any{"user_id": userID, "group_id": d.Id()})
+				if err := addUserToGroup(userID, d.Id(), ctx, d, meta); err != nil {
+					return diagutil.ToDiags(d, err, nil)
+				}
+			}
+		}
+	}
+	return resourceGroupRead(ctx, d, meta)
+}
+
+func resourceGroupRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	group, apiResponse, err := client.UserManagementApi.UmGroupsFindById(ctx, d.Id()).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil
+		}
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching a Group: %w", err), nil)
+	}
+
+	if err := setGroupData(ctx, client, d, &group); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
+
+func resourceGroupUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	tempCreateDataCenter := d.Get("create_datacenter").(bool)
+	tempCreateSnapshot := d.Get("create_snapshot").(bool)
+	tempReserveIp := d.Get("reserve_ip").(bool)
+	tempAccessActivityLog := d.Get("access_activity_log").(bool)
+	tempCreatePcc := d.Get("create_pcc").(bool)
+	tempS3Privilege := d.Get("s3_privilege").(bool)
+	tempCreateBackupUnit := d.Get("create_backup_unit").(bool)
+	tempCreateInternetAccess := d.Get("create_internet_access").(bool)
+	tempCreateK8sCluster := d.Get("create_k8s_cluster").(bool)
+	tempCreateFlowLog := d.Get("create_flow_log").(bool)
+	tempCreateNetworkSecurityGroups := d.Get("create_network_security_groups").(bool)
+	tempAccessAndManageMonitoring := d.Get("access_and_manage_monitoring").(bool)
+	tempAccessAndManageCertificates := d.Get("access_and_manage_certificates").(bool)
+	tempAccessAndManageDns := d.Get("access_and_manage_dns").(bool)
+	tempManageRegistry := d.Get("manage_registry").(bool)
+	tempManageDataplatform := d.Get("manage_dataplatform").(bool)
+	tempAccessAndManageLogging := d.Get("access_and_manage_logging").(bool)
+	tempAccessAndManageCdn := d.Get("access_and_manage_cdn").(bool)
+	tempAccessAndManageVpn := d.Get("access_and_manage_vpn").(bool)
+	tempAccessAndManageApiGateway := d.Get("access_and_manage_api_gateway").(bool)
+	tempAccessAndManageKaas := d.Get("access_and_manage_kaas").(bool)
+	tempAccessAndManageNetworkFileStorage := d.Get("access_and_manage_network_file_storage").(bool)
+	tempAccessAndManageAiModelHub := d.Get("access_and_manage_ai_model_hub").(bool)
+	tempAccessAndManageIamResources := d.Get("access_and_manage_iam_resources").(bool)
+
+	tempManageDBaaS := d.Get("manage_dbaas").(bool)
+
+	groupReq := ionoscloud.Group{
+		Properties: &ionoscloud.GroupProperties{
+			CreateDataCenter:                  &tempCreateDataCenter,
+			CreateSnapshot:                    &tempCreateSnapshot,
+			ReserveIp:                         &tempReserveIp,
+			AccessActivityLog:                 &tempAccessActivityLog,
+			CreatePcc:                         &tempCreatePcc,
+			S3Privilege:                       &tempS3Privilege,
+			CreateBackupUnit:                  &tempCreateBackupUnit,
+			CreateInternetAccess:              &tempCreateInternetAccess,
+			CreateK8sCluster:                  &tempCreateK8sCluster,
+			CreateFlowLog:                     &tempCreateFlowLog,
+			CreateNetworkSecurityGroups:       &tempCreateNetworkSecurityGroups,
+			AccessAndManageMonitoring:         &tempAccessAndManageMonitoring,
+			AccessAndManageCertificates:       &tempAccessAndManageCertificates,
+			ManageDBaaS:                       &tempManageDBaaS,
+			AccessAndManageLogging:            &tempAccessAndManageLogging,
+			AccessAndManageDns:                &tempAccessAndManageDns,
+			ManageRegistry:                    &tempManageRegistry,
+			ManageDataplatform:                &tempManageDataplatform,
+			AccessAndManageCdn:                &tempAccessAndManageCdn,
+			AccessAndManageVpn:                &tempAccessAndManageVpn,
+			AccessAndManageApiGateway:         &tempAccessAndManageApiGateway,
+			AccessAndManageKaas:               &tempAccessAndManageKaas,
+			AccessAndManageNetworkFileStorage: &tempAccessAndManageNetworkFileStorage,
+			AccessAndManageAiModelHub:         &tempAccessAndManageAiModelHub,
+			AccessAndManageIamResources:       &tempAccessAndManageIamResources,
+		},
+	}
+
+	_, newValue := d.GetChange("name")
+	newValueStr := newValue.(string)
+	groupReq.Properties.Name = &newValueStr
+
+	_, apiResponse, err := client.UserManagementApi.UmGroupsPut(ctx, d.Id()).Group(groupReq).Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, fmt.Errorf("an error occurred while patching a group: %w", err), &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutUpdate); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutUpdate).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	if d.HasChange("user_id") {
+		oldValue, newValue := d.GetChange("user_id")
+
+		userIDToAdd := newValue.(string)
+		userIDToRemove := oldValue.(string)
+
+		tflog.Info(ctx, "group user_id change", map[string]any{"user_to_add": userIDToAdd, "user_to_remove": userIDToRemove})
+
+		if userIDToAdd != "" {
+			if err := addUserToGroup(userIDToAdd, d.Id(), ctx, d, meta); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+
+		if userIDToRemove != "" {
+			if err := deleteUserFromGroup(userIDToRemove, d.Id(), ctx, d, meta); err != nil {
+				return diagutil.ToDiags(d, err, nil)
+			}
+		}
+	}
+
+	if d.HasChange("user_ids") {
+		oldValues, newValues := d.GetChange("user_ids")
+		oldUsersList := slice.AnyToString(oldValues.(*schema.Set).List())
+		newUsersList := slice.AnyToString(newValues.(*schema.Set).List())
+
+		newUsers := utils.DiffSliceOneWay(newUsersList, oldUsersList)
+		deletedUsers := utils.DiffSliceOneWay(oldUsersList, newUsersList)
+
+		if newUsers != nil && len(newUsers) > 0 {
+			tflog.Info(ctx, "new users to add to group", map[string]any{"user_ids": newUsers, "group_id": d.Id()})
+			for _, userID := range newUsers {
+				if err := addUserToGroup(userID, d.Id(), ctx, d, meta); err != nil {
+					return diagutil.ToDiags(d, err, nil)
+				}
+			}
+		}
+
+		if deletedUsers != nil && len(deletedUsers) > 0 {
+			tflog.Info(ctx, "users to remove from group", map[string]any{"user_ids": deletedUsers, "group_id": d.Id()})
+			for _, userID := range deletedUsers {
+				if err := deleteUserFromGroup(userID, d.Id(), ctx, d, meta); err != nil {
+					return diagutil.ToDiags(d, err, nil)
+				}
+			}
+		}
+	}
+
+	return resourceGroupRead(ctx, d, meta)
+}
+
+func resourceGroupDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	apiResponse, err := client.UserManagementApi.UmGroupsDelete(ctx, d.Id()).Execute()
+	logApiRequestTime(apiResponse)
+	if err != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, err, &diagutil.ErrorContext{RequestID: diagutil.ExtractRequestID(requestLocation), StatusCode: apiResponse.SafeStatusCode()})
+	}
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutDelete); errState != nil {
+		requestLocation, _ := apiResponse.SafeLocation()
+		return diagutil.ToDiags(d, errState, &diagutil.ErrorContext{Timeout: d.Timeout(schema.TimeoutDelete).String(), RequestID: diagutil.ExtractRequestID(requestLocation)})
+	}
+
+	d.SetId("")
+	return nil
+}
+
+func resourceGroupImporter(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	grpID := d.Id()
+
+	group, apiResponse, err := client.UserManagementApi.UmGroupsFindById(ctx, grpID).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		if httpNotFound(apiResponse) {
+			d.SetId("")
+			return nil, diagutil.ToError(d, fmt.Errorf("group does not exist %q", grpID), nil)
+		}
+		return nil, diagutil.ToError(d, fmt.Errorf("an error occurred while trying to fetch the group: %w", err), nil)
+
+	}
+
+	tflog.Info(ctx, "group found", map[string]any{"group_id": grpID})
+
+	if err := d.Set("get_users_data", constant.DefaultGetUsersData); err != nil {
+		return nil, diagutil.ToError(d, fmt.Errorf("error while setting the default value for the 'get_users_data' attribute inside the import function, error: %w", err), nil)
+	}
+
+	if err := setGroupData(ctx, client, d, &group); err != nil {
+		return nil, diagutil.ToError(d, err, nil)
+	}
+
+	return []*schema.ResourceData{d}, nil
+}
+
+func setGroupData(ctx context.Context, client *ionoscloud.APIClient, d *schema.ResourceData, group *ionoscloud.Group) error {
+
+	if group.Id != nil {
+		d.SetId(*group.Id)
+	}
+
+	if group.Properties != nil {
+		if group.Properties.Name != nil {
+			err := d.Set("name", *group.Properties.Name)
+			if err != nil {
+				return fmt.Errorf("error while setting name property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateDataCenter != nil {
+			err := d.Set("create_datacenter", *group.Properties.CreateDataCenter)
+			if err != nil {
+				return fmt.Errorf("error while setting create_datacenter property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateSnapshot != nil {
+			err := d.Set("create_snapshot", *group.Properties.CreateSnapshot)
+			if err != nil {
+				return fmt.Errorf("error while setting create_snapshot property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.ReserveIp != nil {
+			err := d.Set("reserve_ip", *group.Properties.ReserveIp)
+			if err != nil {
+				return fmt.Errorf("error while setting reserve_ip property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessActivityLog != nil {
+			err := d.Set("access_activity_log", *group.Properties.AccessActivityLog)
+			if err != nil {
+				return fmt.Errorf("error while setting access_activity_log property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreatePcc != nil {
+			err := d.Set("create_pcc", *group.Properties.CreatePcc)
+			if err != nil {
+				return fmt.Errorf("error while setting create_pcc property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.S3Privilege != nil {
+			err := d.Set("s3_privilege", *group.Properties.S3Privilege)
+			if err != nil {
+				return fmt.Errorf("error while setting s3_privilege property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateBackupUnit != nil {
+			err := d.Set("create_backup_unit", *group.Properties.CreateBackupUnit)
+			if err != nil {
+				return fmt.Errorf("error while setting create_backup_unit property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateInternetAccess != nil {
+			err := d.Set("create_internet_access", *group.Properties.CreateInternetAccess)
+			if err != nil {
+				return fmt.Errorf("error while setting create_internet_access property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateK8sCluster != nil {
+			err := d.Set("create_k8s_cluster", *group.Properties.CreateK8sCluster)
+			if err != nil {
+				return fmt.Errorf("error while setting create_k8s_cluster property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateFlowLog != nil {
+			err := d.Set("create_flow_log", *group.Properties.CreateFlowLog)
+			if err != nil {
+				return fmt.Errorf("error while setting create_flow_log property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.CreateNetworkSecurityGroups != nil {
+			err := d.Set("create_network_security_groups", *group.Properties.CreateNetworkSecurityGroups)
+			if err != nil {
+				return fmt.Errorf("error while setting create_network_security_groups property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageMonitoring != nil {
+			err := d.Set("access_and_manage_monitoring", *group.Properties.AccessAndManageMonitoring)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_monitoring property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageCertificates != nil {
+			err := d.Set("access_and_manage_certificates", *group.Properties.AccessAndManageCertificates)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_certificates property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageDns != nil {
+			err := d.Set("access_and_manage_dns", *group.Properties.AccessAndManageDns)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_dns property for group %s: %w", d.Id(), err)
+			}
+		}
+		if group.Properties.ManageRegistry != nil {
+			err := d.Set("manage_registry", *group.Properties.ManageRegistry)
+			if err != nil {
+				return fmt.Errorf("error while setting manage_registry property for group %s: %w", d.Id(), err)
+			}
+		}
+		if group.Properties.ManageDataplatform != nil {
+			err := d.Set("manage_dataplatform", *group.Properties.ManageDataplatform)
+			if err != nil {
+				return fmt.Errorf("error while setting manage_dataplatform property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageLogging != nil {
+			err := d.Set("access_and_manage_logging", *group.Properties.AccessAndManageLogging)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_logging property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageCdn != nil {
+			err := d.Set("access_and_manage_cdn", *group.Properties.AccessAndManageCdn)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_cdn property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageVpn != nil {
+			err := d.Set("access_and_manage_vpn", *group.Properties.AccessAndManageVpn)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_vpn property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageApiGateway != nil {
+			err := d.Set("access_and_manage_api_gateway", *group.Properties.AccessAndManageApiGateway)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_api_gateway property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageKaas != nil {
+			err := d.Set("access_and_manage_kaas", *group.Properties.AccessAndManageKaas)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_kaas property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageNetworkFileStorage != nil {
+			err := d.Set("access_and_manage_network_file_storage", *group.Properties.AccessAndManageNetworkFileStorage)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_network_file_storage property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageAiModelHub != nil {
+			err := d.Set("access_and_manage_ai_model_hub", *group.Properties.AccessAndManageAiModelHub)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_ai_model_hub property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.AccessAndManageIamResources != nil {
+			err := d.Set("access_and_manage_iam_resources", *group.Properties.AccessAndManageIamResources)
+			if err != nil {
+				return fmt.Errorf("error while setting access_and_manage_iam_resources property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		if group.Properties.ManageDBaaS != nil {
+			err := d.Set("manage_dbaas", *group.Properties.ManageDBaaS)
+			if err != nil {
+				return fmt.Errorf("error while setting manage_dbaas property for group %s: %w", d.Id(), err)
+			}
+		}
+
+		usersEntries := make([]any, 0)
+		if d.Get("get_users_data").(bool) {
+			users, apiResponse, err := client.UserManagementApi.UmGroupsUsersGet(ctx, d.Id()).Depth(1).Execute()
+			logApiRequestTime(apiResponse)
+			if err != nil {
+				return fmt.Errorf("an error occurred while UmGroupsUsersGet %s %w", d.Id(), err)
+			}
+			if users.Items != nil && len(*users.Items) > 0 {
+				usersEntries = make([]any, len(*users.Items))
+				for userIndex, user := range *users.Items {
+					userEntry := make(map[string]any)
+
+					if user.Id != nil {
+						userEntry["id"] = *user.Id
+					}
+
+					if user.Properties != nil {
+						if user.Properties.Firstname != nil {
+							userEntry["first_name"] = *user.Properties.Firstname
+						}
+
+						if user.Properties.Lastname != nil {
+							userEntry["last_name"] = *user.Properties.Lastname
+						}
+
+						if user.Properties.Email != nil {
+							userEntry["email"] = *user.Properties.Email
+						}
+
+						if user.Properties.Administrator != nil {
+							userEntry["administrator"] = *user.Properties.Administrator
+						}
+
+						if user.Properties.ForceSecAuth != nil {
+							userEntry["force_sec_auth"] = *user.Properties.ForceSecAuth
+						}
+					}
+					usersEntries[userIndex] = userEntry
+				}
+			}
+		}
+		if err := d.Set("users", usersEntries); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func addUserToGroup(userID, groupID string, ctx context.Context, d *schema.ResourceData, meta any) error {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return err
+	}
+	userToAdd := ionoscloud.UserGroupPost{
+		Id: &userID,
+	}
+
+	_, apiResponse, err := client.UserManagementApi.UmGroupsUsersPost(ctx, groupID).User(userToAdd).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		return fmt.Errorf("an error occurred while adding %s user to group ID %s %w", userID, groupID, err)
+	}
+
+	tflog.Info(ctx, "added user to group", map[string]any{"user_id": userID, "group_id": groupID})
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutCreate); errState != nil {
+		return errState
+	}
+
+	return nil
+}
+
+func deleteUserFromGroup(userID, groupID string, ctx context.Context, d *schema.ResourceData, meta any) error {
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClientWithFailover(ctx)
+	if err != nil {
+		return err
+	}
+
+	apiResponse, err := client.UserManagementApi.UmGroupsUsersDelete(ctx, groupID, userID).Execute()
+	logApiRequestTime(apiResponse)
+
+	if err != nil {
+		return fmt.Errorf("an error occurred while deleting %s user from group ID %s %w", userID, groupID, err)
+	}
+
+	tflog.Info(ctx, "deleted user from group", map[string]any{"user_id": userID, "group_id": groupID})
+
+	if errState := bundleclient.WaitForStateChange(ctx, meta, d, apiResponse, schema.TimeoutDelete); errState != nil {
+		return errState
+	}
+
+	return nil
+}
+
+// customGroupDiff establishes the relationship between 'get_users_data' attribute and 'users', when
+// the 'get_users_data' attribute will be modified, the 'users' list will be modified accordingly.
+func customGroupDiff(ctx context.Context, d *schema.ResourceDiff, m any) error {
+	if d.HasChange("get_users_data") {
+		oldVal, newVal := d.GetChange("get_users_data")
+
+		// Flag is turned OFF
+		if oldVal.(bool) && !newVal.(bool) {
+			// Explicitly set the new value in the plan to an empty list.
+			if err := d.SetNew("users", make([]any, 0)); err != nil {
+				return err
+			}
+		}
+
+		// Flag is turned ON
+		if !oldVal.(bool) && newVal.(bool) {
+			if err := d.SetNewComputed("users"); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

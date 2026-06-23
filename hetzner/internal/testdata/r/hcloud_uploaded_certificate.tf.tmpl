@@ -1,0 +1,14 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_uploaded_certificate" "{{ .RName }}" {
+  name        = "{{ .Name }}--{{ .RInt }}"
+  private_key =<<EOT
+{{ .PrivateKey | trim }}
+  EOT
+  certificate =<<EOT
+{{ .Certificate | trim }}
+  EOT
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+}

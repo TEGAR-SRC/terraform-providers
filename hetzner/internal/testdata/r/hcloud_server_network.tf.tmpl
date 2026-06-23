@@ -1,0 +1,23 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_server_network" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  server_id  = {{ .ServerID }}
+  {{- if .NetworkID }}
+  network_id               = {{ .NetworkID }}
+  {{ end }}
+  {{- if .SubNetID }}
+  subnet_id                = {{ .SubNetID }}
+  {{ end }}
+
+  {{- /* Optional properties */}}
+  {{- if .IP }}
+  ip         = "{{ .IP }}"
+  {{ end }}
+  {{- if .AliasIPs }}
+  alias_ips = [{{ .AliasIPs | quoteEach | join ", " }}]
+  {{ end }}
+  {{- if .DependsOn }}
+  depends_on               = [{{ .DependsOn | join ", " }}]
+  {{ end }}
+}

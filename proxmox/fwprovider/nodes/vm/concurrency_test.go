@@ -1,0 +1,100 @@
+//go:build acceptance || all
+
+//testacc:tier=medium
+//testacc:resource=vm
+
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package vm_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bpg/terraform-provider-proxmox/fwprovider/test"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/vms"
+	"github.com/bpg/terraform-provider-proxmox/utils"
+)
+
+func TestBatchCreate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		numVMs = 30
+	)
+
+	if utils.GetAnyStringEnv("TF_ACC") == "" {
+		t.Skip("Acceptance tests are disabled")
+	}
+
+	te := test.InitEnvironment(t)
+
+	ctx := context.Background()
+
+	gen := cluster.NewIDGenerator(te.ClusterClient(), cluster.IDGeneratorConfig{RandomIDs: false})
+
+	sourceID, err := gen.NextID(ctx)
+	require.NoError(t, err)
+
+	createResult := te.NodeClient().VM(0).CreateVM(ctx, &vms.CreateRequestBody{VMID: sourceID})
+
+	require.NoError(t, createResult.Err(), "failed to create VM %d", sourceID)
+
+	ids := make([]int, numVMs)
+
+	t.Cleanup(func() {
+		if result := te.NodeClient().VM(sourceID).DeleteVM(ctx, true, true); result.Err() != nil {
+			t.Logf("cleanup warning: failed to delete source VM %d: %v", sourceID, result.Err())
+		}
+
+		var wg sync.WaitGroup
+		for _, id := range ids {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				if id > 0 {
+					if result := te.NodeClient().VM(id).DeleteVM(ctx, true, true); result.Err() != nil {
+						t.Logf("cleanup warning: failed to delete VM %d: %v", id, result.Err())
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+	})
+
+	var wg sync.WaitGroup
+
+	errs := make([]error, numVMs)
+
+	for i := range numVMs {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			id := 999900 + i
+			cloneResult := te.NodeClient().VM(sourceID).CloneVM(ctx, 5, &vms.CloneRequestBody{VMIDNew: id})
+
+			errs[i] = cloneResult.Err()
+			ids[i] = id
+		}()
+	}
+
+	wg.Wait()
+
+	for i, cloneErr := range errs {
+		assert.NoError(t, cloneErr, "clone VM %d failed", ids[i])
+	}
+}

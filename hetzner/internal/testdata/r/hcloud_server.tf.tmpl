@@ -1,0 +1,102 @@
+{{- /* vim: set ft=terraform: */ -}}
+
+resource "hcloud_server" "{{ .RName }}" {
+  {{/* Required properties */ -}}
+  name        = "{{ .Name }}--{{ .RInt }}"
+  server_type = "{{ .Type }}"
+  image       = "{{ .Image }}"
+
+  {{- /* Optional properties */}}
+  {{- if .LocationName }}
+  location    = "{{ .LocationName }}"
+  {{ end }}
+  {{- if .Datacenter }}
+  datacenter  = "{{ .Datacenter }}"
+  {{ end }}
+  {{- if .SSHKeys }}
+  ssh_keys    = [{{ .SSHKeys | join ", " }}]
+  {{ end }}
+  {{- if .KeepDisk }}
+  keep_disk   = {{ .KeepDisk }}
+  {{ end }}
+  {{- if .ISO }}
+  iso         = {{ .ISO }}
+  {{ end }}
+  {{- if .Rescue }}
+  rescue      = "{{ .Rescue }}"
+  {{ end }}
+  {{- if .Backups }}
+  backups     = {{ .Backups }}
+  {{ end }}
+
+  {{- range $network := .Networks }}{{ with $network }}
+  network {
+      {{- if .NetworkID }}
+      network_id = {{ .NetworkID }}
+      {{ end }}
+      {{- if .SubnetID }}
+      subnet_id  = {{ .SubnetID }}
+      {{ end }}
+      {{- if .IP }}
+      ip         = "{{ .IP }}"
+      {{ end }}
+      {{- if .AliasIPs }}
+      alias_ips = [{{ .AliasIPs | quoteEach | join ", " }}]
+      {{- else }}
+      # Workaround for https://github.com/hetznercloud/terraform-provider-hcloud/issues/650
+      alias_ips = []
+      {{- end }}
+  }
+  {{ end }}
+  {{ end }}
+
+  {{- if .PublicNet }}
+  public_net {
+  {{- range $k,$v := .PublicNet }}
+    {{ $k }} = {{ $v }}
+  {{- end }}
+  }
+  {{ end }}
+
+  {{- if .Labels }}
+  labels = {{ .Labels | toPrettyJson }}
+  {{- end }}
+
+  {{- if .UserData }}
+  user_data   = <<EOF
+{{ .UserData }}
+EOF
+  {{ end }}
+
+  {{ if ne .FirewallIDs nil }}
+  firewall_ids = [
+  {{- range $k,$v := .FirewallIDs }}
+     {{ $v }},
+  {{- end }}
+  ]
+  {{ end }}
+
+  {{- if .DependsOn }}
+  depends_on               = [{{ .DependsOn | join ", " }}]
+  {{ end }}
+
+  {{- if .PlacementGroupID }}
+  placement_group_id = {{ .PlacementGroupID }}
+  {{ end }}
+
+  {{- if .DeleteProtection }}
+  delete_protection = {{ .DeleteProtection }}
+  {{ end }}
+
+  {{- if .RebuildProtection }}
+  rebuild_protection = {{ .RebuildProtection }}
+  {{ end }}
+
+  {{- if .ShutdownBeforeDeletion }}
+  shutdown_before_deletion = {{ .ShutdownBeforeDeletion }}
+  {{ end }}
+
+{{- if .Raw }}
+{{ .Raw | indent 2 }}
+{{- end }}
+}

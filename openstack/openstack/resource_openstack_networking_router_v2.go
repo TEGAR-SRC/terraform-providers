@@ -1,0 +1,510 @@
+package openstack
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+)
+
+func resourceNetworkingRouterV2() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceNetworkingRouterV2Create,
+		ReadContext:   resourceNetworkingRouterV2Read,
+		UpdateContext: resourceNetworkingRouterV2Update,
+		DeleteContext: resourceNetworkingRouterV2Delete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
+
+		Timeouts: &schema.ResourceTimeout{
+			Create: schema.DefaultTimeout(10 * time.Minute),
+			Delete: schema.DefaultTimeout(10 * time.Minute),
+		},
+
+		Schema: map[string]*schema.Schema{
+			"region": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				Computed: true,
+			},
+
+			"name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: false,
+			},
+
+			"description": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: false,
+			},
+
+			"admin_state_up": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				ForceNew: false,
+				Computed: true,
+			},
+
+			"distributed": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				ForceNew: true,
+				Computed: true,
+			},
+
+			"external_network_id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: false,
+				Computed: true,
+			},
+
+			"external_qos_policy_id": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     false,
+				Computed:     true,
+				RequiredWith: []string{"external_network_id"},
+			},
+
+			"enable_snat": {
+				Type:         schema.TypeBool,
+				Optional:     true,
+				ForceNew:     false,
+				Computed:     true,
+				RequiredWith: []string{"external_network_id"},
+			},
+
+			"external_fixed_ip": {
+				Type:         schema.TypeList,
+				Optional:     true,
+				ForceNew:     false,
+				Computed:     true,
+				RequiredWith: []string{"external_network_id"},
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"subnet_id": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+						"ip_address": {
+							Type:     schema.TypeString,
+							Optional: true,
+							Computed: true,
+						},
+					},
+				},
+			},
+
+			"flavor_id": {
+				Type:     schema.TypeString,
+				ForceNew: true,
+				Optional: true,
+			},
+
+			"external_subnet_ids": {
+				Type:          schema.TypeList,
+				Optional:      true,
+				Elem:          &schema.Schema{Type: schema.TypeString},
+				ConflictsWith: []string{"external_fixed_ip"},
+				RequiredWith:  []string{"external_network_id"},
+			},
+
+			"tenant_id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				Computed: true,
+			},
+
+			"value_specs": {
+				Type:     schema.TypeMap,
+				Optional: true,
+				ForceNew: true,
+			},
+
+			"availability_zone_hints": {
+				Type:     schema.TypeList,
+				Computed: true,
+				ForceNew: true,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+
+			"vendor_options": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				MinItems: 1,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"set_router_gateway_after_create": {
+							Type:     schema.TypeBool,
+							Default:  false,
+							Optional: true,
+						},
+					},
+				},
+			},
+
+			"tags": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+
+			"all_tags": {
+				Type:     schema.TypeSet,
+				Computed: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+		},
+	}
+}
+
+func resourceNetworkingRouterV2Create(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	config := meta.(*Config)
+
+	networkingClient, err := config.NetworkingV2Client(ctx, GetRegion(d, config))
+	if err != nil {
+		return diag.Errorf("Error creating OpenStack networking client: %s", err)
+	}
+
+	createOpts := RouterCreateOpts{
+		CreateOpts: routers.CreateOpts{
+			Name:                  d.Get("name").(string),
+			Description:           d.Get("description").(string),
+			TenantID:              d.Get("tenant_id").(string),
+			AvailabilityZoneHints: resourceNetworkingAvailabilityZoneHintsV2(d),
+		},
+		FlavorID:   d.Get("flavor_id").(string),
+		ValueSpecs: MapValueSpecs(d),
+	}
+
+	if asuRaw, ok := d.GetOk("admin_state_up"); ok {
+		asu := asuRaw.(bool)
+		createOpts.AdminStateUp = &asu
+	}
+
+	if dRaw, ok := getOkExists(d, "distributed"); ok {
+		d := dRaw.(bool)
+		createOpts.Distributed = &d
+	}
+
+	// Get Vendor_options
+	vendorOptionsRaw := d.Get("vendor_options").(*schema.Set)
+
+	var vendorUpdateGateway bool
+
+	if vendorOptionsRaw.Len() > 0 {
+		vendorOptions := expandVendorOptions(vendorOptionsRaw.List())
+		vendorUpdateGateway = vendorOptions["set_router_gateway_after_create"].(bool)
+	}
+
+	// Gateway settings
+	var externalNetworkID string
+
+	var gatewayInfo routers.GatewayInfo
+
+	if v := d.Get("external_network_id").(string); v != "" {
+		externalNetworkID = v
+		gatewayInfo.NetworkID = externalNetworkID
+	}
+
+	if v := d.Get("external_qos_policy_id").(string); v != "" {
+		gatewayInfo.QoSPolicyID = v
+	}
+
+	if esRaw, ok := getOkExists(d, "enable_snat"); ok {
+		es := esRaw.(bool)
+		gatewayInfo.EnableSNAT = &es
+	}
+
+	externalFixedIPs := expandNetworkingRouterExternalFixedIPsV2(d.Get("external_fixed_ip").([]any))
+	if len(externalFixedIPs) > 0 {
+		gatewayInfo.ExternalFixedIPs = externalFixedIPs
+	}
+
+	externalSubnetIDs := expandNetworkingRouterExternalSubnetIDsV2(d.Get("external_subnet_ids").([]any))
+
+	// vendorUpdateGateway is a flag for certain vendor-specific virtual routers
+	// which do not allow gateway settings to be set during router creation.
+	// If this flag was not enabled, then we can safely set the gateway
+	// information during create.
+	if !vendorUpdateGateway && externalNetworkID != "" {
+		createOpts.GatewayInfo = &gatewayInfo
+	}
+
+	var router routerExtended
+
+	log.Printf("[DEBUG] openstack_networking_router_v2 create options: %#v", createOpts)
+
+	if len(externalSubnetIDs) == 0 {
+		// router creation without a retry
+		err = routers.Create(ctx, networkingClient, createOpts).ExtractIntoStructPtr(&router, "router")
+		if err != nil {
+			return diag.Errorf("Error creating openstack_networking_router_v2: %s", err)
+		}
+	} else {
+		// create a router in a loop with the first available external subnet
+		for i, externalSubnetID := range externalSubnetIDs {
+			gatewayInfo.ExternalFixedIPs = []routers.ExternalFixedIP{externalSubnetID}
+
+			log.Printf("[DEBUG] openstack_networking_router_v2 create options (try %d): %#v", i+1, createOpts)
+
+			err = routers.Create(ctx, networkingClient, createOpts).ExtractIntoStructPtr(&router, "router")
+			if err != nil {
+				if retryOn409(err) {
+					continue
+				}
+
+				return diag.Errorf("Error creating openstack_networking_router_v2: %s", err)
+			}
+
+			break
+		}
+		// handle the last error
+		if err != nil {
+			return diag.Errorf("Error creating openstack_networking_router_v2: %d subnets exhausted: %s", len(externalSubnetIDs), err)
+		}
+	}
+
+	log.Printf("[DEBUG] Waiting for openstack_networking_router_v2 %s to become available.", router.ID)
+
+	stateConf := &retry.StateChangeConf{
+		Pending:    []string{"BUILD", "PENDING_CREATE", "PENDING_UPDATE"},
+		Target:     []string{"ACTIVE"},
+		Refresh:    resourceNetworkingRouterV2StateRefreshFunc(ctx, networkingClient, router.ID),
+		Timeout:    d.Timeout(schema.TimeoutCreate),
+		Delay:      0,
+		MinTimeout: 3 * time.Second,
+	}
+
+	_, err = stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return diag.Errorf("Error waiting for openstack_networking_router_v2 %s to become available: %s", router.ID, err)
+	}
+
+	d.SetId(router.ID)
+
+	// If the vendorUpdateGateway flag was specified and if an external network
+	// was specified, then set the gateway information after router creation.
+	if vendorUpdateGateway && externalNetworkID != "" {
+		log.Printf("[DEBUG] Adding external_network %s to openstack_networking_router_v2 %s", externalNetworkID, router.ID)
+
+		var updateOpts routers.UpdateOpts
+		updateOpts.GatewayInfo = &gatewayInfo
+
+		_, err = routers.Update(ctx, networkingClient, router.ID, updateOpts).Extract()
+		if err != nil {
+			return diag.Errorf("Error updating openstack_networking_router_v2: %s", err)
+		}
+	}
+
+	tags := networkingV2AttributesTags(d)
+	if len(tags) > 0 {
+		tagOpts := attributestags.ReplaceAllOpts{Tags: tags}
+
+		tags, err := attributestags.ReplaceAll(ctx, networkingClient, "routers", router.ID, tagOpts).Extract()
+		if err != nil {
+			return diag.Errorf("Error setting tags on openstack_networking_router_v2 %s: %s", router.ID, err)
+		}
+
+		log.Printf("[DEBUG] Set tags %s on openstack_networking_router_v2 %s", tags, router.ID)
+	}
+
+	log.Printf("[DEBUG] Created openstack_networking_router_v2 %s: %#v", router.ID, router)
+
+	return resourceNetworkingRouterV2Read(ctx, d, meta)
+}
+
+func resourceNetworkingRouterV2Read(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	config := meta.(*Config)
+
+	networkingClient, err := config.NetworkingV2Client(ctx, GetRegion(d, config))
+	if err != nil {
+		return diag.Errorf("Error creating OpenStack networking client: %s", err)
+	}
+
+	var router routerExtended
+	err = routers.Get(ctx, networkingClient, d.Id()).ExtractIntoStructPtr(&router, "router")
+	if err != nil {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			d.SetId("")
+
+			return nil
+		}
+
+		return diag.Errorf("Error retrieving openstack_networking_router_v2: %s", err)
+	}
+
+	log.Printf("[DEBUG] Retrieved openstack_networking_router_v2 %s: %#v", d.Id(), router)
+
+	// Basic settings.
+	d.Set("name", router.Name)
+	d.Set("description", router.Description)
+	d.Set("admin_state_up", router.AdminStateUp)
+	d.Set("distributed", router.Distributed)
+	d.Set("tenant_id", router.TenantID)
+	d.Set("region", GetRegion(d, config))
+	d.Set("flavor_id", router.FlavorID)
+
+	networkingV2ReadAttributesTags(d, router.Tags)
+
+	if err := d.Set("availability_zone_hints", router.AvailabilityZoneHints); err != nil {
+		log.Printf("[DEBUG] Unable to set openstack_networking_router_v2 %s availability_zone_hints: %s", d.Id(), err)
+	}
+
+	// Gateway settings.
+	d.Set("external_network_id", router.GatewayInfo.NetworkID)
+	d.Set("enable_snat", router.GatewayInfo.EnableSNAT)
+
+	externalFixedIPs := flattenNetworkingRouterExternalFixedIPsV2(router.GatewayInfo.ExternalFixedIPs)
+	if err = d.Set("external_fixed_ip", externalFixedIPs); err != nil {
+		log.Printf("[DEBUG] Unable to set openstack_networking_router_v2 %s external_fixed_ip: %s", d.Id(), err)
+	}
+
+	return nil
+}
+
+func resourceNetworkingRouterV2Update(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	config := meta.(*Config)
+
+	networkingClient, err := config.NetworkingV2Client(ctx, GetRegion(d, config))
+	if err != nil {
+		return diag.Errorf("Error creating OpenStack networking client: %s", err)
+	}
+
+	routerID := d.Id()
+	config.Lock(routerID)
+	defer config.Unlock(routerID)
+
+	var hasChange bool
+
+	var updateOpts routers.UpdateOpts
+
+	if d.HasChange("name") {
+		hasChange = true
+		updateOpts.Name = d.Get("name").(string)
+	}
+
+	if d.HasChange("description") {
+		hasChange = true
+		description := d.Get("description").(string)
+		updateOpts.Description = &description
+	}
+
+	if d.HasChange("admin_state_up") {
+		hasChange = true
+		asu := d.Get("admin_state_up").(bool)
+		updateOpts.AdminStateUp = &asu
+	}
+
+	// Gateway settings.
+	var updateGatewaySettings bool
+
+	var externalNetworkID string
+
+	gatewayInfo := routers.GatewayInfo{}
+
+	if v := d.Get("external_network_id").(string); v != "" {
+		externalNetworkID = v
+	}
+
+	if externalNetworkID != "" {
+		gatewayInfo.NetworkID = externalNetworkID
+	}
+
+	if d.HasChange("external_network_id") {
+		updateGatewaySettings = true
+	}
+
+	if d.HasChange("external_qos_policy_id") {
+		updateGatewaySettings = true
+		gatewayInfo.QoSPolicyID = d.Get("external_qos_policy_id").(string)
+	}
+
+	if d.HasChange("enable_snat") {
+		updateGatewaySettings = true
+		enableSNAT := d.Get("enable_snat").(bool)
+		gatewayInfo.EnableSNAT = &enableSNAT
+	}
+
+	if d.HasChange("external_fixed_ip") {
+		updateGatewaySettings = true
+		externalFixedIPs := expandNetworkingRouterExternalFixedIPsV2(d.Get("external_fixed_ip").([]any))
+		gatewayInfo.ExternalFixedIPs = externalFixedIPs
+	}
+
+	if updateGatewaySettings {
+		hasChange = true
+		updateOpts.GatewayInfo = &gatewayInfo
+	}
+
+	if hasChange {
+		log.Printf("[DEBUG] openstack_networking_router_v2 %s update options: %#v", d.Id(), updateOpts)
+
+		_, err = routers.Update(ctx, networkingClient, d.Id(), updateOpts).Extract()
+		if err != nil {
+			return diag.Errorf("Error updating openstack_networking_router_v2: %s", err)
+		}
+	}
+
+	// Next, perform any required updates to the tags.
+	if d.HasChange("tags") {
+		tags := networkingV2UpdateAttributesTags(d)
+		tagOpts := attributestags.ReplaceAllOpts{Tags: tags}
+
+		tags, err := attributestags.ReplaceAll(ctx, networkingClient, "routers", d.Id(), tagOpts).Extract()
+		if err != nil {
+			return diag.Errorf("Error setting tags on openstack_networking_router_v2 %s: %s", d.Id(), err)
+		}
+
+		log.Printf("[DEBUG] Set tags %s on openstack_networking_router_v2 %s", tags, d.Id())
+	}
+
+	return resourceNetworkingRouterV2Read(ctx, d, meta)
+}
+
+func resourceNetworkingRouterV2Delete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	config := meta.(*Config)
+
+	networkingClient, err := config.NetworkingV2Client(ctx, GetRegion(d, config))
+	if err != nil {
+		return diag.Errorf("Error creating OpenStack networking client: %s", err)
+	}
+
+	if err := routers.Delete(ctx, networkingClient, d.Id()).ExtractErr(); err != nil {
+		return diag.FromErr(CheckDeleted(d, err, "Error deleting openstack_networking_router_v2"))
+	}
+
+	stateConf := &retry.StateChangeConf{
+		Pending:    []string{"ACTIVE"},
+		Target:     []string{"DELETED"},
+		Refresh:    resourceNetworkingRouterV2StateRefreshFunc(ctx, networkingClient, d.Id()),
+		Timeout:    d.Timeout(schema.TimeoutDelete),
+		Delay:      0,
+		MinTimeout: 3 * time.Second,
+	}
+
+	_, err = stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return diag.Errorf("Error deleting openstack_networking_router_v2: %s", err)
+	}
+
+	d.SetId("")
+
+	return nil
+}

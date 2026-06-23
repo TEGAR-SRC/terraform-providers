@@ -1,0 +1,213 @@
+package ionoscloud
+
+import (
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/internal/serverutil"
+)
+
+func dataSourceVCPUServer() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceServerRead,
+		Schema: map[string]*schema.Schema{
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+			},
+			"id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"hostname": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"type": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"cores": {
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"ram": {
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"availability_zone": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"vm_state": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"cpu_family": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"boot_cdrom": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"boot_volume": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"boot_image": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"token": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"cdroms": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem:     serverutil.CdromsServerDSResource,
+			},
+			"security_groups_ids": {
+				Type:     schema.TypeList,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				Computed: true,
+			},
+			"volumes": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"name": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"size": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"availability_zone": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"image_name": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"image_password": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"ssh_keys": {
+							Type:     schema.TypeList,
+							Computed: true,
+							Elem: &schema.Schema{
+								Type: schema.TypeString,
+							},
+						},
+						"bus": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"licence_type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"cpu_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"ram_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"nic_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"nic_hot_unplug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"disc_virtio_hot_plug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"disc_virtio_hot_unplug": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+						"device_number": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"pci_slot": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+						"backup_unit_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"user_data": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"boot_server": {
+							Type:        schema.TypeString,
+							Description: "The UUID of the attached server.",
+							Computed:    true,
+						},
+						"expose_serial": {
+							Type:     schema.TypeBool,
+							Computed: true,
+							Description: "If set to `true` will expose the serial id of the disk attached to the server. " +
+								"If set to `false` will not expose the serial id. Some operating systems or software solutions require the serial id to be exposed to work properly. " +
+								"Exposing the serial can influence licensed software (e.g. Windows) behavior",
+						},
+						"require_legacy_bios": {
+							Type:        schema.TypeBool,
+							Computed:    true,
+							Description: "Indicates if the image requires the legacy BIOS for compatibility or specific needs.",
+						},
+					},
+				},
+			},
+			"nics": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem:     serverutil.NicServerDSResource,
+			},
+			"labels": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem:     labelDataSource,
+			},
+			"nic_multi_queue": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}

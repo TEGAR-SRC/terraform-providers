@@ -1,0 +1,188 @@
+//go:build all || dbaas || psql
+
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	pgsql "github.com/ionos-cloud/sdk-go-bundle/products/dbaas/psql/v2"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/constant"
+)
+
+func TestAccPgSqlUser(t *testing.T) {
+	var user pgsql.UserResource
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		ExternalProviders:        randomProviderVersion343(),
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactoriesInternal(t, &testAccProvider),
+		CheckDestroy:             pgSqlUserDestroyCheck,
+		Steps: []resource.TestStep{
+			{
+				Config: PgSqlUserConfig,
+				Check: resource.ComposeTestCheckFunc(
+					pgSqlUserExistsCheck(constant.PsqlUserResource+"."+constant.UserTestResource, &user),
+					resource.TestCheckResourceAttr(constant.PsqlUserResource+"."+constant.UserTestResource, usernameAttribute, usernameValue),
+					resource.TestCheckResourceAttrSet(constant.PsqlUserResource+"."+constant.UserTestResource, passwordAttribute),
+					resource.TestCheckResourceAttr(constant.PsqlUserResource+"."+constant.UserTestResource, isSystemUserAttribute, isSystemUserValue),
+				),
+			},
+			{
+				Config: PgSqlUserDataSource,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.PsqlUserResource+"."+constant.UserDataSourceByName, usernameAttribute, constant.PsqlUserResource+"."+constant.UserTestResource, usernameAttribute),
+					resource.TestCheckResourceAttrPair(constant.DataSource+"."+constant.PsqlUserResource+"."+constant.UserDataSourceByName, isSystemUserAttribute, constant.PsqlUserResource+"."+constant.UserTestResource, isSystemUserAttribute),
+				),
+			},
+			{
+				Config:      PgSqlUserDataSourceWrongUsername,
+				ExpectError: regexp.MustCompile(`no PgSql user found with the specified username`),
+			},
+		},
+	})
+}
+
+func pgSqlUserExistsCheck(path string, user *pgsql.UserResource) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[path]
+		if !ok {
+			return fmt.Errorf("not found: %s", path)
+		}
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("no ID is set for the PgSql user")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), *resourceDefaultTimeouts.Default)
+		defer cancel()
+		client, err := testAccProvider.Meta().(bundleclient.SdkBundle).NewPsqlClient(ctx, rs.Primary.Attributes["location"])
+		if err != nil {
+			return err
+		}
+		clusterID := rs.Primary.Attributes["cluster_id"]
+		username := rs.Primary.Attributes["username"]
+		foundUser, apiResponse, err := client.FindUserByUsername(ctx, clusterID, username)
+		apiResponse.LogInfo()
+		if err != nil {
+			return fmt.Errorf("error occurred while fetching the PgSql user: %s, cluster ID: %s, error: %w", username, clusterID, err)
+		}
+		user = &foundUser
+		return nil
+	}
+}
+
+func pgSqlUserDestroyCheck(s *terraform.State) error {
+	ctx, cancel := context.WithTimeout(context.Background(), *resourceDefaultTimeouts.Delete)
+	defer cancel()
+
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != constant.PsqlUserResource {
+			continue
+		}
+		client, err := testAccProvider.Meta().(bundleclient.SdkBundle).NewPsqlClient(ctx, rs.Primary.Attributes["location"])
+		if err != nil {
+			return err
+		}
+		clusterID := rs.Primary.Attributes["cluster_id"]
+		username := rs.Primary.Attributes["username"]
+		_, apiResponse, err := client.FindUserByUsername(ctx, clusterID, username)
+		apiResponse.LogInfo()
+		if err != nil {
+			if !apiResponse.HttpNotFound() {
+				return fmt.Errorf("an error occurred while checking the deletion of PgSql username: %s, cluster ID: %s, error: %w", username, clusterID, err)
+			}
+		} else {
+			return fmt.Errorf("PgSql user %s still exists in the cluster with ID: %s", username, clusterID)
+		}
+	}
+	return nil
+}
+
+// Attributes
+const usernameAttribute = "username"
+const passwordAttribute = "password"
+const isSystemUserAttribute = "is_system_user"
+
+// Values
+const usernameValue = "testusername"
+const isSystemUserValue = "false"
+
+// Configurations
+const PgSqlUserConfig = `
+resource ` + constant.DatacenterResource + ` "datacenter_example" {
+  name        = "datacenter_example"
+  location    = "gb/lhr"
+  description = "Datacenter for testing DBaaS PgSql user"
+}
+
+resource ` + constant.LanResource + ` "lan_example" {
+  datacenter_id = ` + constant.DatacenterResource + `.datacenter_example.id 
+  public        = false
+  name          = "lan_example"
+}
+
+resource ` + constant.PsqlClusterResource + ` ` + constant.DBaaSClusterTestResource + ` {
+  postgres_version   = 16
+  instances          = 1
+  cores              = 1
+  ram                = 4096
+  storage_size       = 10240
+  storage_type       = "HDD"
+  connections   {
+	datacenter_id   =  ` + constant.DatacenterResource + `.datacenter_example.id 
+    lan_id          =  ` + constant.LanResource + `.lan_example.id 
+    cidr            =  "192.168.1.100/24"
+  }
+  location = ` + constant.DatacenterResource + `.datacenter_example.location
+  backup_location = "de"
+  display_name = "` + constant.DBaaSClusterTestResource + `"
+  maintenance_window {
+    day_of_the_week  = "Sunday"
+    time             = "09:00:00"
+  }
+  credentials {
+  	username = "username"
+	password = ` + constant.RandomPassword + `.cluster_password.result
+  }
+  synchronization_mode = "ASYNCHRONOUS"
+}
+
+resource ` + constant.PsqlUserResource + ` ` + constant.UserTestResource + ` {
+  ` + clusterIDAttribute + ` = ` + constant.PsqlClusterResource + `.` + constant.DBaaSClusterTestResource + `.id 
+  ` + usernameAttribute + ` = "` + usernameValue + `"
+  ` + passwordAttribute + ` = ` + constant.RandomPassword + `.user_password.result
+}
+
+resource ` + constant.RandomPassword + ` "cluster_password" {
+  length           = 16
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+resource ` + constant.RandomPassword + ` "user_password" {
+  length           = 16
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+`
+
+const PgSqlUserDataSource = PgSqlUserConfig + `
+data ` + constant.PsqlUserResource + ` ` + constant.UserDataSourceByName + ` {
+  ` + clusterIDAttribute + ` = ` + constant.PsqlClusterResource + `.` + constant.DBaaSClusterTestResource + `.id  
+  username = ` + constant.PsqlUserResource + `.` + constant.UserTestResource + `.username
+}
+`
+
+const PgSqlUserDataSourceWrongUsername = PgSqlUserConfig + `
+data ` + constant.PsqlUserResource + ` ` + constant.UserDataSourceByName + ` {
+  ` + clusterIDAttribute + ` = ` + constant.PsqlClusterResource + `.` + constant.DBaaSClusterTestResource + `.id  
+  username = "nonexistent"
+}
+`

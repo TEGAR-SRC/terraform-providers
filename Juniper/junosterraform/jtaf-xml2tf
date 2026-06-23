@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from copy import deepcopy
+from lxml import etree
+import sys
+import re
+import os
+from xml.etree import ElementTree
+from junosterraform.jtaf_common import build_type_map, normalize_tag
+
+missing_xpaths = set()
+
+def convert_to_hcl(value, indent=2):
+    """
+    Converts Python dictionary or list into Terraform-compatible HCL syntax.
+    """
+    spaces = " " * indent
+    if isinstance(value, dict):
+        return "{\n" + "\n".join([f'{spaces}{k} = {convert_to_hcl(v, indent + 2)}' for k, v in value.items()]) + f'\n{spaces[:-2]}}}'
+    elif isinstance(value, list):
+        return "[\n" + ",\n".join([spaces + convert_to_hcl(item, indent + 2) for item in value]) + f'\n{spaces[:-2]}]'
+    elif isinstance(value, bool):
+        return "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        return str(value)
+    else:
+        return f'"{value}"'
+
+def parse_element(element, explicit_empty_tags, type_lookup, parent_path=""):
+    """
+    Recursively parse an XML element into a nested structure for HCL conversion.
+    - Empty tags become `True`
+    - Tags with only text return scalar value
+    - Tags with children return list[dict] to enforce HCL consistency
+    """    
+    tag_name = etree.QName(element.tag).localname
+    has_text = element.text is not None and element.text.strip() != ""
+    has_children = len(element) > 0
+    path = f"{parent_path}/{tag_name}" if parent_path and parent_path != tag_name else tag_name
+    normalized_path = normalize_tag(path)
+
+    # Check if path is valid in schema or not
+    if normalized_path not in type_lookup:
+        if normalized_path not in missing_xpaths:
+            missing_xpaths.add(normalized_path)
+            print(f"\t-- [WARN] XML config '{missing_xpaths}' not defined in YANG. Removing it from generating in this and subsequent .tf files\n\t\tTo enable configuration of this element, add it to a YANG augment file.\n\t\t - Regenerate the provider using jtaf-yang2go and include the cooresponding yang file using the -p option in addition to the existing YANG files.\n", file=sys.stderr)
+        return None
+        
+    # Check if this element should be a leaf-list
+    type_info = type_lookup.get(normalized_path, {})
+    is_leaf_list = type_info.get("type") == "leaf-list"
+
+    # Self-closing or empty tag
+    if not has_text and not has_children:
+        if tag_name in explicit_empty_tags:
+            return [{}]
+        else:
+            return ""
+
+    # Case: <name>ge-0/0/3</name> → "ge-0/0/3"
+    if element.text and element.text.strip() and len(element) == 0:
+        text_value = element.text.strip()
+        if is_leaf_list:
+            try:
+                return [int(text_value)]
+            except ValueError:
+                return [text_value]
+        try:
+            return int(text_value)
+        except ValueError:
+            return text_value
+
+    # Default case: has children
+    parsed = {}
+    for child in element:
+        child_data = parse_element(child, explicit_empty_tags, type_lookup, path)
+        if child_data is None:
+            continue
+        tag = normalize_tag(child.tag)
+
+        # If tag repeats, make sure it’s a flat list
+        if tag in parsed:
+            if not isinstance(parsed[tag], list):
+                parsed[tag] = [parsed[tag]]
+
+            # Flatten if child_data is a single-item list with a dict
+            if isinstance(child_data, list) and len(child_data) == 1 and isinstance(child_data[0], dict):
+                parsed[tag].append(child_data[0])
+            else:
+                parsed[tag].append(child_data[0])
+        else:
+            # First occurrence — flatten single-item dict-lists
+            if isinstance(child_data, list) and len(child_data) == 1 and isinstance(child_data[0], dict):
+                parsed[tag] = [child_data[0]]
+            else:
+                parsed[tag] = child_data
+
+    return [parsed]  # Always return a list of dict for elements with children
+
+def create_provider_block(device_type, include_provider_block=True):
+    """
+    Generates a single Terraform-style provider block for each hostname.
+    """    
+   # if include_provider_block is True then create a provider block for the device type
+    if include_provider_block:
+        provider_block = f"""terraform {{
+  required_providers {{
+    junos-{device_type} = {{
+      source = "hashicorp/junos-{device_type}"
+    }}
+  }}
+}}
+"""
+        return provider_block
+    return ""
+def edit_provider_block(device_type, provider_block):
+    """
+    Edits the provider block to include the hostnames, username, and password.
+    """
+    block = provider_block
+    # Parse the existing provider block to add new device type
+    
+    # Check if the device type already exists
+    if f'junos-{device_type}' in block:
+        return block
+    
+    # Extract the existing required_providers content
+    providers_match = re.search(r'required_providers\s*{\s*(.*?)\s*}\s*}(.*)?', block, re.DOTALL)
+    
+    if providers_match:
+        existing_providers = providers_match.group(1).strip()
+
+        # Capture any content after first closing brace of providers.tf
+        after_block = providers_match.group(2).strip()[1:] if providers_match.group(2) else ""
+        
+        # Add new provider entry
+        new_provider = "}\n\t" + f'junos-{device_type} = {{\n      source = "hashicorp/junos-{device_type}"\n    }}'
+        
+        # Combine existing and new providers
+        if existing_providers:
+            updated_providers = existing_providers + '\n    ' + new_provider
+        else:
+            updated_providers = new_provider
+        
+        # Reconstruct the provider block
+        block = f"""terraform {{
+  required_providers {{
+    {updated_providers}
+  }}
+}}
+{after_block}
+"""
+
+    return block
+
+def create_head_block(device_type, hostname, username, password):
+    """
+    Generates a single Terraform-style resource block combining all top-level elements.
+    """
+    provider_block = ""
+
+    provider_block += f"""
+provider "junos-{device_type}" {{
+    host     = "{hostname}"
+    port     = 22
+    username = "{username}"
+    password = "{password}"
+    alias    = "{hostname.replace("-", "_")}"
+}}
+"""
+    return provider_block
+
+def _merge_named_object_lists(base_list, overlay_list):
+    merged = [deepcopy(item) for item in base_list]
+    index_by_key = {}
+
+    for index, item in enumerate(merged):
+        if not isinstance(item, dict):
+            return merged + [deepcopy(item) for item in overlay_list]
+        key = item.get("name")
+        if key is None:
+            return merged + [deepcopy(item) for item in overlay_list]
+        index_by_key[key] = index
+
+    for item in overlay_list:
+        if not isinstance(item, dict):
+            merged.append(deepcopy(item))
+            continue
+        key = item.get("name")
+        if key is None:
+            merged.append(deepcopy(item))
+            continue
+        if key in index_by_key:
+            merged[index_by_key[key]] = merge_parsed_values(merged[index_by_key[key]], item)
+        else:
+            index_by_key[key] = len(merged)
+            merged.append(deepcopy(item))
+
+    return merged
+
+
+def merge_parsed_values(base_value, overlay_value):
+    if base_value is None:
+        return deepcopy(overlay_value)
+    if overlay_value is None:
+        return deepcopy(base_value)
+
+    if isinstance(base_value, dict) and isinstance(overlay_value, dict):
+        merged = deepcopy(base_value)
+        for key, value in overlay_value.items():
+            if key in merged:
+                merged[key] = merge_parsed_values(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
+
+    if isinstance(base_value, list) and isinstance(overlay_value, list):
+        if (
+            len(base_value) == 1
+            and len(overlay_value) == 1
+            and isinstance(base_value[0], dict)
+            and isinstance(overlay_value[0], dict)
+            and "name" not in base_value[0]
+            and "name" not in overlay_value[0]
+        ):
+            return [merge_parsed_values(base_value[0], overlay_value[0])]
+
+        if all(isinstance(item, dict) and item.get("name") is not None for item in base_value + overlay_value):
+            return _merge_named_object_lists(base_value, overlay_value)
+
+        merged = [deepcopy(item) for item in base_value]
+        for item in overlay_value:
+            if item not in merged:
+                merged.append(deepcopy(item))
+        return merged
+
+    return deepcopy(overlay_value)
+
+
+# Generates a Terraform-style resource block for the given parsed data.
+def generate_hcl_resources(parsed_data, device_type, hostname):
+    """
+    Generates a single Terraform-style resource block targeting the device base configuration.
+    """
+    resource_block = ""
+
+    resource_block += f'resource "terraform-provider-junos-{device_type}" "{hostname}-base-config" {{\n'
+    resource_block += '  resource_name = "base-config"\n'
+    resource_block += f'  provider = junos-{device_type}.{hostname.replace("-", "_")}\n'
+
+    for key, value in parsed_data.items():
+        hcl_value = convert_to_hcl(value, indent=4)
+        resource_block += f'  {key} = {hcl_value}\n'
+
+    resource_block += "}\n"
+    return resource_block
+
+
+def parse_xml_to_hcl(xml_file, device_type, hostname, type_lookup):
+    """
+    Parses an XML file and converts it to Terraform-style HCL resources.
+    Starts from <configuration> if under <rpc-reply> and removes <version> if present.
+    """
+    try:
+        # Read the XML file content
+        with open(xml_file, 'r') as file:
+            xml_content = file.read()
+
+        # Capture explicitly empty tags (e.g. <foo></foo>)
+        explicit_empty_tags = set()
+        for match in re.finditer(r"<(\w[\w\-]*)>\s*</\1>", xml_content):
+            explicit_empty_tags.add(match.group(1))
+
+        # Wrap with a temporary root to ensure well-formedness
+        wrapped_xml = f"<root>{xml_content}</root>"
+        root = etree.fromstring(wrapped_xml)
+
+        # Try to find the <configuration> node under <rpc-reply>
+        config_node = root.find(".//configuration")
+        if config_node is not None:
+            # Replace root with configuration node
+            root = config_node
+        
+        groups = {}
+        apply_groups = []
+
+        # Extract and remove <apply-groups>
+        for ag in root.findall('./apply-groups'):
+            if ag.text:
+                apply_groups.append(ag.text.strip())
+            root.remove(ag)
+
+        # Extract and remove <groups>
+        groups_elem = root.findall('./groups')
+        for group in groups_elem:
+            group_name_elem = group.find('./name')
+            if group_name_elem is not None:
+                group_name = group_name_elem.text.strip()
+                groups[group_name] = group
+            root.remove(group)
+
+        # Remove any <version> tag directly under root
+        version_node = root.find("./version")
+        if version_node is not None:
+            root.remove(version_node)
+
+        # Parse elements starting from the new root
+        resources = []
+        # Build base resource from root-level config and flatten any applied groups into it.
+        base_data = {}
+        for elem in root:
+            tag = normalize_tag(elem.tag)
+            value = parse_element(elem, explicit_empty_tags, type_lookup)
+            if value is None:
+                continue
+            base_data[tag] = value
+
+        applied_group_data = {}
+        for group_name in apply_groups:
+            if group_name == "base-config":
+                continue
+            group_node = groups.get(group_name)
+            if group_node is None:
+                continue
+
+            group_data = {}
+            for elem in group_node:
+                tag = normalize_tag(elem.tag)
+                if tag == "name":
+                    continue
+                value = parse_element(elem, explicit_empty_tags, type_lookup)
+                if value is None:
+                    continue
+                group_data[tag] = value
+
+            applied_group_data = merge_parsed_values(applied_group_data, group_data)
+
+        final_data = merge_parsed_values(applied_group_data, base_data)
+        resources.append(generate_hcl_resources(final_data, device_type, hostname))
+
+        return "\n".join(resources)
+
+    except Exception as e:
+        print(f"Error parsing XML: {e}")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate Terraform .tf resources from XML using trimmed schema.',
+        exit_on_error=True,
+    )
+    parser.add_argument(
+        '-j',
+        '--trimmed_json',
+        required=True,
+        help='Path to trimmed_schema.json generated by jtaf-provider/jtaf-yang2go.',
+    )
+    parser.add_argument(
+        '-x',
+        '--xml-config',
+        required=True,
+        nargs="+",
+        help='One or more Junos XML config files to convert into .tf resources.',
+    )
+    parser.add_argument(
+        '-t',
+        '--type',
+        required=True,
+        help='Device type used in generated provider/resource names.',
+    )
+    parser.add_argument(
+        '-d',
+        '--directory',
+        required=True,
+        help='Output directory for generated providers.tf and .tf files.',
+    )
+
+    ## Add optional options to take in username and password
+    parser.add_argument('-u', '--username', help='Username to place in generated provider blocks.')
+    parser.add_argument('-p', '--password', help='Password to place in generated provider blocks.')
+    args = parser.parse_args()
+
+    trimmed_json_file = args.trimmed_json
+    xml_files = args.xml_config
+    device_type = args.type
+
+    if args.username and args.password:
+        username = args.username
+        password = args.password
+    else:
+        username = ""
+        password = ""
+
+    # --- Load JSON schema ---
+    with open(trimmed_json_file, 'r') as f:
+        schema = json.load(f)
+    config_node = None
+    for child in schema["root"]["children"]:
+        if child["name"] == "configuration":
+            config_node = child
+            break
+    if not config_node:
+        raise ValueError("No configuration node found in JSON schema")
+
+    # Using the trimmed json schema, build map of path to its type
+    type_lookup = build_type_map(config_node)
+    
+    # --- Normalize schema lookup to match normalized XML paths ---
+    normalized_type_lookup = {}
+    for key, val in type_lookup.items():
+        normalized_type_lookup[normalize_tag(key)] = val
+    type_lookup = normalized_type_lookup
+
+    # Traverse xml to create HCL resources
+    # Create provider source block in providers.tf 
+    directory = args.directory
+    provider_file = f"{directory}/providers.tf"
+    if os.path.exists(provider_file):
+        with open(provider_file, "r") as f:
+            provider_block = f.read()
+        
+        # Edit the provider block to include device type (idempotent)
+        provider_block = edit_provider_block(device_type, provider_block)
+
+        with open(provider_file, "w") as f:
+            f.write(provider_block)
+    else:
+        # Create fresh provider block
+        provider_block = create_provider_block(device_type)
+        os.makedirs(directory, exist_ok=True)
+        with open(provider_file, "w") as f:
+            f.write(provider_block)
+
+    for file in xml_files:
+        print(f"\nProcessing XML file: {file}")
+        hostname = file.split("/")[-1].split(".")[0]
+        head_block = create_head_block(device_type, hostname, username, password)
+        if head_block:
+            with open(provider_file, "r") as f:
+                existing = f.read()
+
+            # Append only if hostname NOT already in providers.tf
+            if hostname not in existing:
+                with open(provider_file, "a") as f:
+                    f.write("\n" + head_block)
+            else:
+                print(f"\n  -> Skipping provider block for hostname '{hostname}' (already exists).\n")
+
+        # Write per-device .tf file
+        hcl_output = parse_xml_to_hcl(file, device_type, hostname, type_lookup)
+        if hcl_output:
+            filename = f"{directory}/{hostname}.tf"
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename, "w") as f:
+                f.write(hcl_output)
+            print(f"   --->  DONE: Wrote output to {filename}\n")
+
+if __name__ == "__main__":
+    main()

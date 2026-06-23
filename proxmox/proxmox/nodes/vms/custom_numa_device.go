@@ -1,0 +1,103 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+package vms
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+
+	"github.com/bpg/terraform-provider-proxmox/proxmox/helpers/ptr"
+)
+
+// CustomNUMADevice handles QEMU NUMA device parameters.
+type CustomNUMADevice struct {
+	CPUIDs        []string  `json:"cpus"                url:"cpus,semicolon"`
+	HostNodeNames *[]string `json:"hostnodes,omitempty" url:"hostnodes,omitempty,semicolon"`
+	Memory        *int      `json:"memory,omitempty"    url:"memory,omitempty"`
+	Policy        *string   `json:"policy,omitempty"    url:"policy,omitempty"`
+}
+
+// CustomNUMADevices handles QEMU NUMA device parameters by slot.
+type CustomNUMADevices map[int]CustomNUMADevice
+
+// EncodeValues converts a CustomNUMADevice struct to a URL value.
+func (r *CustomNUMADevice) EncodeValues(key string, v *url.Values) error {
+	values := []string{
+		fmt.Sprintf("cpus=%s", strings.Join(r.CPUIDs, ";")),
+	}
+
+	if r.HostNodeNames != nil {
+		values = append(values, fmt.Sprintf("hostnodes=%s", strings.Join(*r.HostNodeNames, ";")))
+	}
+
+	if r.Memory != nil {
+		values = append(values, fmt.Sprintf("memory=%d", *r.Memory))
+	}
+
+	if r.Policy != nil {
+		values = append(values, fmt.Sprintf("policy=%s", *r.Policy))
+	}
+
+	v.Add(key, strings.Join(values, ","))
+
+	return nil
+}
+
+// EncodeValues converts a CustomNUMADevices map to multiple URL values.
+func (r CustomNUMADevices) EncodeValues(key string, v *url.Values) error {
+	slots := make([]int, 0, len(r))
+	for slot := range r {
+		slots = append(slots, slot)
+	}
+
+	sort.Ints(slots)
+
+	for _, slot := range slots {
+		device := r[slot]
+		if err := device.EncodeValues(fmt.Sprintf("%s%d", key, slot), v); err != nil {
+			return fmt.Errorf("failed to encode NUMA device %d: %w", slot, err)
+		}
+	}
+
+	return nil
+}
+
+// UnmarshalJSON converts a CustomNUMADevice string to an object.
+func (r *CustomNUMADevice) UnmarshalJSON(b []byte) error {
+	var s string
+	var err error
+
+	if err = json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("failed to unmarshal CustomNUMADevice: %w", err)
+	}
+
+	pairs := strings.SplitSeq(s, ",")
+
+	for p := range pairs {
+		v := strings.Split(strings.TrimSpace(p), "=")
+		if len(v) == 2 {
+			switch v[0] {
+			case "cpus":
+				r.CPUIDs = strings.Split(v[1], ";")
+			case "hostnodes":
+				hostnodes := strings.Split(v[1], ";")
+				r.HostNodeNames = &hostnodes
+			case "memory":
+				if r.Memory, err = ptr.ParseIntPtr(v[1], "memory size"); err != nil {
+					return err
+				}
+			case "policy":
+				r.Policy = &v[1]
+			}
+		}
+	}
+
+	return nil
+}

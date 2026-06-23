@@ -1,0 +1,445 @@
+package utils
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"reflect"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/huandu/xstrings"
+	"github.com/mitchellh/mapstructure"
+	"golang.org/x/crypto/ssh"
+)
+
+const DefaultTimeout = 60 * time.Minute
+const BucketDefaultTimeout = 10 * time.Minute
+
+// CreateTransport - creates customizable transport for http clients
+func CreateTransport(insecure bool) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		DisableKeepAlives:     true,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConnsPerHost:   3,
+		MaxConnsPerHost:       3,
+	}
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecure}
+	return transport
+}
+
+func DiffSlice(slice1 []string, slice2 []string) []string {
+	var diff []string
+
+	// Loop two times, first to find slice1 strings not in slice2,
+	// second loop to find slice2 strings not in slice1
+	for i := range 2 {
+		for _, s1 := range slice1 {
+			found := slices.Contains(slice2, s1)
+			// String not found. We add it to return slice
+			if !found {
+				diff = append(diff, s1)
+			}
+		}
+		// Swap the slices, only if it was the first loop
+		if i == 0 {
+			slice1, slice2 = slice2, slice1
+		}
+	}
+
+	return diff
+}
+
+// DiffSliceOneWay returns the elements in `a` that aren't in `b`.
+func DiffSliceOneWay(a, b []string) []string {
+	mb := make(map[string]struct{}, len(b))
+	for _, x := range b {
+		mb[x] = struct{}{}
+	}
+	var diff []string
+	for _, x := range a {
+		if _, found := mb[x]; !found {
+			diff = append(diff, x)
+		}
+	}
+	return diff
+}
+
+func GenerateSetError(resource, field string, err error) error {
+	return fmt.Errorf("occurred while setting %s property for %s, %w", field, resource, err)
+}
+
+func GenerateImmutableError(resource, field string) error {
+	return fmt.Errorf("%s property is immutable for %s", field, resource)
+}
+
+func SetPropWithNilCheck(m map[string]any, prop string, v any) {
+
+	rVal := reflect.ValueOf(v)
+	if rVal.Kind() == reflect.Pointer {
+		if !rVal.IsNil() {
+			m[prop] = rVal.Elem().Interface()
+		}
+	} else {
+		m[prop] = v
+	}
+}
+
+func GenerateEmail() string {
+	email := fmt.Sprintf("terraform_test-%d@mailinator.com", time.Now().UnixNano())
+	return email
+}
+
+func IsValidUUID(uuid string) bool {
+	r := regexp.MustCompile("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
+	return r.MatchString(uuid)
+}
+
+func TestNotEmptySlice(resource, attribute string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		for _, rs := range s.RootModule().Resources {
+			if rs.Type != resource {
+				continue
+			}
+
+			lengthOfSlice := rs.Primary.Attributes[attribute]
+
+			if lengthOfSlice == "0" {
+				return fmt.Errorf("returned version slice is empty")
+			}
+		}
+		return nil
+	}
+}
+
+func TestValueInSlice(resource, attribute, value string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		for _, rs := range s.RootModule().Resources {
+			if rs.Type != resource {
+				continue
+			}
+
+			lengthOfSlice, err := strconv.Atoi(rs.Primary.Attributes[attribute])
+
+			if err != nil {
+				return err
+			} else if lengthOfSlice <= 0 {
+				return fmt.Errorf("returned %s slice is empty", attribute)
+			} else {
+				for i := range lengthOfSlice {
+					attribute = attribute[:len(attribute)-1] + strconv.Itoa(i)
+					if rs.Primary.Attributes[attribute] == value {
+						return nil
+					}
+				}
+			}
+
+		}
+		return fmt.Errorf("value %s not in %s slice", value, attribute)
+	}
+}
+
+func TestImageNotNull(resource, attribute string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		for _, rs := range s.RootModule().Resources {
+			if rs.Type != resource {
+				continue
+			}
+
+			image := rs.Primary.Attributes[attribute]
+
+			if image == "" {
+				return fmt.Errorf("%s is empty, expected an UUID", attribute)
+			} else if !IsValidUUID(image) {
+				return fmt.Errorf("%s should be a valid UUID, got: %#v", attribute, image)
+			}
+
+		}
+		return nil
+	}
+}
+
+func CheckFileExists(filePath string) bool {
+	_, err := os.Open(filePath) // For read access.
+	return err == nil
+}
+
+// WriteToFile - creates the file and writes 'value' to it.
+func WriteToFile(ctx context.Context, name, value string) error {
+	file, err := os.Create(name)
+	defer func() {
+		err = file.Close()
+		if err != nil {
+			tflog.Debug(ctx, "could not close file", map[string]any{"error": err})
+		}
+	}()
+
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(value)
+	return err
+}
+
+// DiffWithoutNewLines terraform suppress differences between newlines
+func DiffWithoutNewLines(_, old, new string, _ *schema.ResourceData) bool {
+	old = RemoveNewLines(old)
+	new = RemoveNewLines(new)
+	return strings.EqualFold(old, new)
+}
+
+func RemoveNewLines(s string) string {
+	newlines := regexp.MustCompile(`(?:\r\n?|\n)*\z`)
+	return newlines.ReplaceAllString(s, "")
+}
+
+// DiffToLower terraform suppress differences between lower and upper
+func DiffToLower(_, old, new string, _ *schema.ResourceData) bool {
+	return strings.EqualFold(old, new)
+}
+
+// DiffEmptyIps suppress difference when empty value for array is overwritten by API and assigned an actual IP address
+func DiffEmptyIps(_, old, new string, _ *schema.ResourceData) bool {
+	if old != "" && new == "" {
+		return true
+	}
+	return false
+}
+
+// ResourceReadyFunc polls api to see if resource exists based on id
+type ResourceReadyFunc func(ctx context.Context, d *schema.ResourceData) (bool, error)
+
+// WaitForResourceToBeReady - keeps retrying until resource is ready(true is returned), or until err is thrown, or ctx is cancelled
+func WaitForResourceToBeReady(ctx context.Context, d *schema.ResourceData, fn ResourceReadyFunc) error {
+	if d.Id() == "" {
+		return fmt.Errorf("id not present for resource")
+	}
+	// might be a good idea to pass the timeout from outside
+	return retry.RetryContext(ctx, d.Timeout(schema.TimeoutCreate), func() *retry.RetryError {
+		isReady, err := fn(ctx, d)
+		if isReady {
+			return nil
+		}
+		if err != nil {
+			return retry.NonRetryableError(err)
+		}
+		tflog.Debug(ctx, "resource not ready, still trying", map[string]any{"id": d.Id()})
+		return retry.RetryableError(fmt.Errorf("resource with id %s not ready, still trying ", d.Id()))
+	})
+}
+
+// IsResourceDeletedFunc polls api to see if resource exists based on id
+type IsResourceDeletedFunc func(ctx context.Context, d *schema.ResourceData) (bool, error)
+
+// WaitForResourceToBeDeleted - keeps retrying until resource is not found(404), or until ctx is cancelled
+func WaitForResourceToBeDeleted(ctx context.Context, d *schema.ResourceData, fn IsResourceDeletedFunc) error {
+
+	err := retry.RetryContext(ctx, d.Timeout(schema.TimeoutDelete), func() *retry.RetryError {
+		isDeleted, err := fn(ctx, d)
+		if isDeleted {
+			return nil
+		}
+		if err != nil {
+			return retry.NonRetryableError(err)
+		}
+		tflog.Debug(ctx, "resource still has not been deleted", map[string]any{"id": d.Id()})
+		return retry.RetryableError(fmt.Errorf("resource with id %s found, still trying ", d.Id()))
+	})
+	return err
+}
+
+// DecodeInterfaceToStruct can decode from interface{}, or from []interface
+// will turn "" into nil values
+// takes snake_case fields and decodes them into camelCase fields of struct
+// used to decode values from TypeList and TypeSet of schema(`d`) directly into sdk structs
+func DecodeInterfaceToStruct(ctx context.Context, input, output any) error {
+	config := mapstructure.DecoderConfig{
+		DecodeHook:       PointerEmptyToNil(),
+		ErrorUnused:      false,
+		ErrorUnset:       false,
+		ZeroFields:       false,
+		WeaklyTypedInput: true,
+		MatchName:        IsSnakeEqualToCamelCase,
+		Result:           &output,
+	}
+	customDecoder, err := mapstructure.NewDecoder(&config)
+	if err != nil {
+		return err
+	}
+	tflog.Debug(ctx, "rawdata to decode", map[string]any{"input": fmt.Sprintf("%v", input)})
+	err = customDecoder.Decode(input)
+	if err != nil {
+		return err
+	}
+	return err
+}
+
+func IsSnakeEqualToCamelCase(a, b string) bool {
+	return strings.EqualFold(xstrings.ToCamelCase(a), b)
+}
+
+func PointerEmptyToNil() mapstructure.DecodeHookFuncType {
+	return func(f reflect.Type, t reflect.Type, data any) (any, error) {
+		if f.Kind() == reflect.String && data == "" {
+			return nil, nil
+		}
+		return data, nil
+	}
+}
+
+// checks if value['1'] of key[`id`] is present inside a slice of maps[string]interface{}
+func IsValueInSliceOfMap[T comparable](sliceOfMaps []any, key string, value T) bool {
+	for _, mmap := range sliceOfMaps {
+		// do not delete if the id in the old rule is present in the new rules to be updated
+		if value == mmap.(map[string]any)[key] {
+			return true
+		}
+	}
+	return false
+}
+
+// DecodeStructToMap SDK struct to map[string]interface{}
+func DecodeStructToMap(input any) (map[string]any, error) {
+	var result map[string]any
+	config := &mapstructure.DecoderConfig{
+		Metadata:         nil,
+		TagName:          "json",
+		MatchName:        IsCamelCaseEqualToSnakeCase,
+		WeaklyTypedInput: true,
+		ErrorUnused:      false,
+		DecodeHook:       PointerEmptyToNil(),
+		ErrorUnset:       false,
+		ZeroFields:       false,
+		Result:           &result,
+	}
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return result, err
+	}
+	err = decoder.Decode(input)
+	if err != nil {
+		return nil, err
+	}
+
+	newResult := make(map[string]any)
+	for k, v := range result {
+		newResult[xstrings.ToSnakeCase(k)] = v
+	}
+
+	return newResult, nil
+}
+
+func IsCamelCaseEqualToSnakeCase(a, b string) bool {
+	return strings.EqualFold(xstrings.ToSnakeCase(a), b)
+}
+
+// ReadPublicKey Reads public key from file or directly provided and returns key string if valid
+func ReadPublicKey(ctx context.Context, pathOrKey string) (string, error) {
+	var err error
+	bytes := []byte(pathOrKey)
+
+	if CheckFileExists(pathOrKey) {
+		tflog.Debug(ctx, "ssh key has been provided in a file", map[string]any{"path": pathOrKey})
+		if bytes, err = os.ReadFile(pathOrKey); err != nil {
+			return "", err
+		}
+	}
+	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(bytes)
+	if err != nil {
+		return "", fmt.Errorf("error for public key %s, check if path is correct or key is in correct format", pathOrKey)
+	}
+	return string(ssh.MarshalAuthorizedKey(pubKey)), nil
+}
+
+// MergeMaps merges a slice of map[string]any entries into one map.
+// Note: Maps should be disjoint, otherwise overlapping keys will be overwritten.
+func MergeMaps(maps ...map[string]any) map[string]any {
+	merged := map[string]any{}
+	for _, m := range maps {
+		for k := range m {
+			merged[k] = m[k]
+		}
+	}
+	return merged
+}
+
+// ConfigCompose can be called to concatenate multiple strings to build test configurations
+func ConfigCompose(config ...string) string {
+	var str strings.Builder
+
+	for _, conf := range config {
+		str.WriteString(conf)
+	}
+
+	return str.String()
+}
+
+// NameMatches checks if the name matches the value, with partialMatch set to true, it will check if the value is a substring of the name
+func NameMatches(name, value string, partialMatch bool) bool {
+	if partialMatch {
+		return strings.Contains(name, value)
+	}
+	return strings.EqualFold(name, value)
+}
+
+// IsStateFailed checks if the provided state represents a failed state.
+func IsStateFailed(state string) bool {
+	return state == ionoscloud.Failed || state == ionoscloud.FailedSuspended || state == ionoscloud.FailedUpdating || state == ionoscloud.FailedDestroying
+}
+
+// CleanURL makes sure trailing slash does not corrupt the state
+func CleanURL(url string) string {
+	length := len(url)
+	if length > 1 && url[length-1] == '/' {
+		url = url[:length-1]
+	}
+
+	return url
+}
+
+// ToInterfaceSlice converts any slice of type T into a slice of interfaces.
+func ToInterfaceSlice[T any](slice []T) []any {
+	r := make([]any, len(slice))
+	for i, v := range slice {
+		r[i] = v
+	}
+	return r
+}
+
+// Deepcopy performs a deep copy of the input struct using JSON marshal and unmarshal. This is a generic function
+// that can be used for any type, but it relies on the type being JSON serializable.
+func Deepcopy[T any](in T, target *T) error {
+	data, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data for deep copy: %w", err)
+	}
+
+	err = json.Unmarshal(data, target)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal data for deep copy: %w", err)
+	}
+
+	return nil
+}

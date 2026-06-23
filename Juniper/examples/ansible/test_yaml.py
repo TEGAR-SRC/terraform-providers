@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+import yaml
+from jinja2 import Environment, FileSystemLoader, Undefined
+import os
+import argparse
+
+
+class SilentUndefined(Undefined):
+    """Jinja2 Undefined subclass that silently returns empty string for undefined vars."""
+    def _fail_with_undefined_error(self, *args, **kwargs):
+        return ''
+
+
+# Load YAML data
+def load_yaml(file_path):
+    """Load and parse YAML file.
+
+    Args:
+        file_path: Path to YAML file.
+
+    Returns:
+        Parsed YAML data structure.
+    """
+    with open(file_path) as file:
+        return yaml.safe_load(file)
+
+
+# Render Jinja2 template
+def render_template(template_path, context):
+    """Render Jinja2 template with provided context.
+
+    Args:
+        template_path: Path to Jinja2 template file.
+        context: Dictionary of variables for template rendering.
+
+    Returns:
+        Rendered template string.
+    """
+    env = Environment(loader=FileSystemLoader(os.path.dirname(template_path)), undefined=SilentUndefined)
+    template_name = os.path.basename(template_path)
+    template = env.get_template(template_name)
+    return template.render(context, undefined=SilentUndefined)
+
+
+# Main function to test YAML and Jinja2
+def main(yaml_file, template_file):
+    """Load YAML, render Jinja2 template, and save XML output.
+
+    Args:
+        yaml_file: Path to YAML data file.
+        template_file: Path to Jinja2 template file.
+    """
+    # Load YAML data
+    yaml_data = load_yaml(yaml_file)
+
+    # Render the template with YAML data
+    xml_output = render_template(template_file, yaml_data)
+
+    # Save the output to an XML file
+    with open('output.xml', 'w') as xml_file:
+        xml_file.write(xml_output)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Process YAML and Jinja2 template files.')
+    parser.add_argument('yaml_file', help='Path to the YAML file')
+    parser.add_argument('template_file', help='Path to the Jinja2 template file')
+    args = parser.parse_args()
+
+    main(args.yaml_file, args.template_file)

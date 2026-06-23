@@ -1,0 +1,168 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	ionoscloud "github.com/ionos-cloud/sdk-go/v6"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceLan() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceLanRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"name": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"location": {
+				Type:        schema.TypeString,
+				Description: "The location of the resource. This field should be used only if you are also using a file configuration and should not be configured otherwise.",
+				Optional:    true,
+			},
+			"datacenter_id": {
+				Type:             schema.TypeString,
+				Required:         true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringIsNotWhiteSpace),
+			},
+			"ip_failover": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"nic_uuid": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"ip": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
+			},
+			"pcc": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"public": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+			"ipv4_cidr_block": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "For public LANs this property is null, for private LANs it contains the private IPv4 CIDR range.",
+			},
+			"ipv6_cidr_block": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func convertIpFailoverList(ips *[]ionoscloud.IPFailover) []any {
+	if ips == nil {
+		return make([]any, 0)
+	}
+
+	ret := make([]any, len(*ips), len(*ips))
+	for i, ip := range *ips {
+		entry := make(map[string]any)
+
+		entry["ip"] = ip.Ip
+		entry["nic_uuid"] = ip.NicUuid
+
+		ret[i] = entry
+	}
+
+	return ret
+}
+
+func dataSourceLanRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	datacenterID, dcIDOk := d.GetOk("datacenter_id")
+	if !dcIDOk {
+		return diagutil.ToDiags(d, fmt.Errorf("no datacenter_id was specified"), nil)
+	}
+
+	id, idOk := d.GetOk("id")
+	name, nameOk := d.GetOk("name")
+
+	if idOk && nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("id and name cannot be both specified in the same time"), nil)
+	}
+	if !idOk && !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide either the lan id or name"), nil)
+	}
+	var lan ionoscloud.Lan
+	var err error
+	var apiResponse *ionoscloud.APIResponse
+
+	location := d.Get("location").(string)
+	client, err := meta.(bundleclient.SdkBundle).NewCloudAPIClient(ctx, location)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	if idOk {
+		/* search by ID */
+		lan, apiResponse, err = client.LANsApi.DatacentersLansFindById(ctx, datacenterID.(string), id.(string)).Execute()
+		logApiRequestTime(apiResponse)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching lan with ID %s: %w", id.(string), err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+	} else {
+		/* search by name */
+		var lans ionoscloud.Lans
+
+		lans, apiResponse, err := client.LANsApi.DatacentersLansGet(ctx, datacenterID.(string)).Depth(1).Execute()
+		logApiRequestTime(apiResponse)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching lans: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+
+		var results []ionoscloud.Lan
+
+		if lans.Items != nil {
+			for _, l := range *lans.Items {
+				if l.Properties != nil && l.Properties.Name != nil && *l.Properties.Name == name.(string) {
+					/* lan found */
+					lan, apiResponse, err = client.LANsApi.DatacentersLansFindById(ctx, datacenterID.(string), *l.Id).Execute()
+					logApiRequestTime(apiResponse)
+					if err != nil {
+						return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching lan %s: %w", *l.Id, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+					}
+					results = append(results, l)
+				}
+			}
+		}
+
+		if results == nil || len(results) == 0 {
+			return diagutil.ToDiags(d, fmt.Errorf("no lan found with the specified name: %s", name), nil)
+		} else if len(results) > 1 {
+			return diagutil.ToDiags(d, fmt.Errorf("more than one lan found with the specified criteria name: %s", name), nil)
+		} else {
+			lan = results[0]
+		}
+	}
+
+	if err = setLanData(d, &lan); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}

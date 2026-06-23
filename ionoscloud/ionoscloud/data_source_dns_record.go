@@ -1,0 +1,150 @@
+package ionoscloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	dns "github.com/ionos-cloud/sdk-go-bundle/products/dns/v2"
+	"github.com/ionos-cloud/sdk-go-bundle/shared"
+
+	"github.com/ionos-cloud/terraform-provider-ionoscloud/v6/services/bundleclient"
+	diagutil "github.com/ionos-cloud/terraform-provider-ionoscloud/v6/utils/diags"
+)
+
+func dataSourceDNSRecord() *schema.Resource {
+	return &schema.Resource{
+		ReadContext: dataSourceRecordRead,
+		Schema: map[string]*schema.Schema{
+			"id": {
+				Type:             schema.TypeString,
+				Description:      "The ID of your DNS Record.",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+				Optional:         true,
+				Computed:         true,
+			},
+			"name": {
+				Type:        schema.TypeString,
+				Description: "The name of your DNS Record.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"partial_match": {
+				Type:        schema.TypeBool,
+				Description: "Whether partial matching is allowed or not when using name argument.",
+				Default:     false,
+				Optional:    true,
+			},
+			"zone_id": {
+				Type:             schema.TypeString,
+				Description:      "The UUID of an existing DNS Zone",
+				ValidateDiagFunc: validation.ToDiagFunc(validation.IsUUID),
+				Required:         true,
+			},
+			"type": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"content": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"ttl": {
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"priority": {
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"enabled": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+			"fqdn": {
+				Type:        schema.TypeString,
+				Description: "Fully qualified domain name",
+				Computed:    true,
+			},
+		},
+		Timeouts: &resourceDefaultTimeouts,
+	}
+}
+
+func dataSourceRecordRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(bundleclient.SdkBundle).DNSClient
+	partialMatch := d.Get("partial_match").(bool)
+	zoneID := d.Get("zone_id").(string)
+	idValue, idOk := d.GetOk("id")
+	nameValue, nameOk := d.GetOk("name")
+	recordID := idValue.(string)
+	recordName := nameValue.(string)
+
+	if idOk && nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("ID and name cannot be both specified at the same time"), nil)
+	}
+	if !idOk && !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("please provide either the DNS Record ID or name"), nil)
+	}
+	if partialMatch && !nameOk {
+		return diagutil.ToDiags(d, fmt.Errorf("partial_match can only be used together with the name attribute"), nil)
+	}
+
+	var record dns.RecordRead
+	var apiResponse *shared.APIResponse
+	var err error
+
+	if idOk {
+		record, apiResponse, err = client.GetRecordById(ctx, zoneID, recordID)
+		if err != nil {
+			return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching the DNS Record with ID: %s, DNS Zone ID: %s, error: %w", recordID, zoneID, err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+		}
+	} else {
+		var results []dns.RecordRead
+		tflog.Info(ctx, "searching DNS record by name", map[string]any{"name": recordName, "partial_match": partialMatch})
+		if partialMatch {
+			// By default, when providing the name as a filter, for the GET requests, partial match
+			// is true.
+			records, apiResponse, err := client.ListRecords(ctx, recordName)
+			if err != nil {
+				return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching DNS Records: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+			}
+			results = records.Items
+		} else {
+			// In order to have an exact name match, we must retrieve all the DNS Records and then
+			// build a list of exact matches based on the response, there is no other way since using
+			// filter.name only does a partial match.
+			records, apiResponse, err := client.ListRecords(ctx, "")
+			if err != nil {
+				return diagutil.ToDiags(d, fmt.Errorf("an error occurred while fetching DNS Records: %w", err), &diagutil.ErrorContext{StatusCode: apiResponse.SafeStatusCode()})
+			}
+			for _, recordItem := range records.Items {
+				// Since each record has a unique name, there is no need to keep on searching if
+				// we already found the required record.
+				if len(results) == 1 {
+					break
+				}
+				if strings.EqualFold(recordItem.Properties.Name, recordName) {
+					results = append(results, recordItem)
+				}
+			}
+		}
+		if results == nil || len(results) == 0 {
+			return diagutil.ToDiags(d, fmt.Errorf("no DNS Record found with the specified name = %s", recordName), nil)
+		} else if len(results) > 1 {
+			return diagutil.ToDiags(d, fmt.Errorf("more than one DNS Record found with the specified name = %s", recordName), nil)
+		} else {
+			record = results[0]
+		}
+	}
+
+	if err := client.SetRecordData(d, record); err != nil {
+		return diagutil.ToDiags(d, err, nil)
+	}
+
+	return nil
+}
