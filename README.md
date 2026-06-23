@@ -1,97 +1,127 @@
-# Terraform Providers
+﻿# Terraform Providers
 
 Monorepo for custom Terraform providers.
 Repo: [github.com/TEGAR-SRC/terraform-providers](https://github.com/TEGAR-SRC/terraform-providers)
 
 ## Provider List
 
-| # | Provider | Versi | Status | Deskripsi |
-|---|----------|-------|--------|-----------|
-| 1 | [`digitalocean`](./digitalocean) | - | Archived | Fork dari official `terraform-provider-digitalocean`. Manage Droplets, spaces, volumes, DNS, dan resource DigitalOcean lainnya |
-| 2 | [`hetzner`](./hetzner) | - | Fork | Fork dari official `terraform-provider-hetzner`. Manage server cloud Hetzner, dedicated server, dan network |
-| 3 | [`hostinger`](./hostinger) | - | Internal | Provider untuk Hostinger / hPanel API. Manage hosting account, domain, email, dan VPS |
-| 4 | [`ionoscloud`](./ionoscloud) | - | Fork | Fork dari official `terraform-provider-ionoscloud`. Manage IONOS Cloud infrastructure, datacenter, server, storage |
-| 5 | [`Juniper`](./Juniper) | - | Internal | Provider untuk Juniper network devices. Manage konfigurasi switch, router, firewall Juniper via API |
-| 6 | [`mikrotik`](./mikrotik) | - | Internal | Provider untuk MikroTik RouterOS. Manage interface, firewall, DHCP, routing, dan konfigurasi RouterBoard |
-| 7 | [`onidelcloud`](./onidelcloud) | 0.1.0 | **Active** | Provider untuk Onidel Cloud API. 10 resource + 13 data sources: SSH Key, VPC, Firewall, VM, Object Storage, Reserved IP, IP List, Startup Script, Snapshot, Backup |
-| 8 | [`openstack`](./openstack) | - | Fork | Fork dari official `terraform-provider-openstack`. Manage OpenStack compute, network, storage, identity |
-| 9 | [`proxmox`](./proxmox) | - | Fork | Fork & custom Proxmox VE provider. Manage VM, container, storage, cluster Proxmox |
-| 10 | [`rustfs`](./rustfs) | - | Internal | Provider untuk RustFS / MinIO-compatible object storage. Manage bucket, policy, service account, quota, user |
-| 11 | [`virtualizor`](./virtualizor) | - | Internal | Provider untuk Virtualizor VPS. Manage virtual server, plan, ISO, dan resource Virtualizor |
-| 12 | [`vmware`](./vmware) | - | Fork | Fork dari official `terraform-provider-vmware` (vSphere). Manage VM, datastore, network, cluster vSphere |
+| # | Provider | Version | Status | Description |
+|---|----------|---------|--------|-------------|
+| 1 | [`digitalocean`](./digitalocean) | - | Archived | Fork of official `terraform-provider-digitalocean`. Manage Droplets, Spaces, Volumes, DNS, Floating IPs, Load Balancers, and all DigitalOcean services. Mature provider used by thousands |
+| 2 | [`hetzner`](./hetzner) | - | Fork | Fork of official `terraform-provider-hetzner`. Manage Cloud servers, dedicated servers, SSH keys, networks, volumes, firewalls, and load balancers on Hetzner |
+| 3 | [`hostinger`](./hostinger) | - | Internal | Provider for Hostinger / hPanel API. Manage hosting accounts, domains, business email, VPS, SSL certificates, and databases. Built from reverse-engineered hPanel API |
+| 4 | [`ionoscloud`](./ionoscloud) | - | Fork | Fork of official `terraform-provider-ionoscloud`. Manage virtual datacenters, servers, volumes, NICs, LANs, load balancers, backups, and other IONOS Cloud resources |
+| 5 | [`Juniper`](./Juniper) | - | Internal | Provider for Juniper network devices (JunOS). Manage switch, router, and firewall configurations via NETCONF/API. Supports interfaces, VLANs, routing policy, firewall filters |
+| 6 | [`mikrotik`](./mikrotik) | - | Internal | Provider for MikroTik RouterOS. Manage ethernet/wireless interfaces, firewall filter/NAT, DHCP server/client, OSPF/BGP routing, bridges, queues, and all RouterBoard features |
+| 7 | [`onidelcloud`](./onidelcloud) | 0.1.0 | **Active** | Provider for Onidel Cloud API. 10 resources + 13 data sources: SSH Key, VPC, Firewall Group & Rule, Virtual Machine + VM Action, Object Storage, IP List, Reserved IP, Startup Script, Snapshot, Backup, OS Template, Instance Type & Price, Teams |
+| 8 | [`openstack`](./openstack) | - | Fork | Fork of official `terraform-provider-openstack`. Manage compute (servers, flavors, keypairs), networking (networks, subnets, routers, floating IPs), storage (volumes, objects), identity (users, projects, roles) |
+| 9 | [`proxmox`](./proxmox) | - | Fork | Fork and custom Proxmox VE provider. Manage QEMU VMs, LXC containers, storage pools, cluster resources, backups, firewalls, and user management for Proxmox Virtual Environment |
+| 10 | [`rustfs`](./rustfs) | - | Internal | Provider for RustFS / MinIO-compatible object storage. Manage buckets, access policies, service accounts, storage quotas, and users. Suitable for self-hosted S3-compatible storage |
+| 11 | [`virtualizor`](./virtualizor) | - | Internal | Provider for Virtualizor VPS. Manage virtual server creation/destroy, plan management, ISO library, network interfaces, bandwidth monitoring, and user management |
+| 12 | [`vmware`](./vmware) | - | Fork | Fork of official `terraform-provider-vmware` (vSphere). Manage virtual machines, datastores, network switches, cluster compute resources, content libraries, tags, permissions, and other vSphere resources |
 
 ## Repository Structure
 
 ```
 terraform-providers/
-├── README.md              ← You are here
-├── digitalocean/          # DigitalOcean provider
-├── hetzner/               # Hetzner Cloud provider
-├── hostinger/             # Hostinger provider
-├── ionoscloud/            # IONOS Cloud provider
-├── Juniper/               # Juniper provider
-├── mikrotik/              # MikroTik provider
-├── onidelcloud/           # Onidel Cloud provider
-│   ├── main.go
-│   ├── go.mod / go.sum
-│   ├── GNUmakefile
-│   ├── scripts/
-│   └── onidelcloud/
-│       ├── provider.go
-│       ├── provider_test.go
-│       ├── config/config.go
-│       ├── sshkey/           # resource + data source
-│       ├── vpc/              # resource + data source
-│       ├── firewall/         # 2 resource + data source
-│       ├── vm/               # resource + data source + action
-│       ├── objectstorage/    # resource + data source
-│       ├── iplist/           # resource + data source
-│       ├── reservedip/       # resource
-│       ├── startupscript/    # resource + data source
-│       ├── ostemplate/       # data source
-│       ├── instancetype/     # data source + price
-│       ├── teams/            # data source
-│       ├── snapshot/         # data source
-│       └── backup/           # data source
-├── openstack/             # OpenStack provider
-├── proxmox/               # Proxmox provider
-├── rustfs/                # RustFS / MinIO provider
-├── virtualizor/           # Virtualizor provider
-└── vmware/                # VMware vSphere provider
+|-- README.md              (EN - English)
+|-- README-id.md           (ID - Bahasa Indonesia)
+|-- scripts/
+|   |-- generate-readme.ps1        Automated README generator
+|   |-- gofmtcheck.sh              Go formatting check script
+|-- digitalocean/                  DigitalOcean provider
+|-- hetzner/                       Hetzner Cloud provider
+|-- hostinger/                     Hostinger provider
+|-- ionoscloud/                    IONOS Cloud provider
+|-- Juniper/                       Juniper provider
+|-- mikrotik/                      MikroTik provider
+|-- onidelcloud/                   Onidel Cloud provider
+|   |-- main.go
+|   |-- go.mod / go.sum
+|   |-- GNUmakefile
+|   |-- scripts/
+|   |-- onidelcloud/
+|   |   |-- provider.go
+|   |   |-- provider_test.go
+|   |   |-- config/
+|   |   |   |-- config.go          HTTP API client with Bearer auth
+|   |   |-- sshkey/                Resource: ssh_key | DS: ssh_keys
+|   |   |-- vpc/                   Resource: vpc | DS: vpcs
+|   |   |-- firewall/              Resource: firewall_group, firewall_rule | DS: firewall_groups
+|   |   |-- vm/                    Resource: vm, vm_action | DS: vms
+|   |   |-- objectstorage/         Resource: object_storage | DS: object_storage_services
+|   |   |-- iplist/                Resource: ip_list | DS: ip_lists
+|   |   |-- reservedip/            Resource: reserved_ip
+|   |   |-- startupscript/         Resource: startup_script | DS: startup_scripts
+|   |   |-- ostemplate/            DS: os_template
+|   |   |-- instancetype/          DS: instance_type, instance_price
+|   |   |-- teams/                 DS: teams
+|   |   |-- snapshot/              DS: snapshots
+|   |   |-- backup/                DS: backups
+|-- openstack/                     OpenStack provider
+|-- proxmox/                       Proxmox provider
+|-- rustfs/                        RustFS / MinIO provider
+|   |-- main.go
+|   |-- go.mod / go.sum
+|   |-- GNUmakefile
+|   |-- provider/
+|   |   |-- provider.go
+|   |   |-- all_client.go
+|   |   |-- helper.go
+|   |   |-- rustfs_bucket_ressource.go
+|   |   |-- rustfs_policy_ressource.go
+|   |   |-- rustfs_quota_ressource.go
+|   |   |-- rustfs_service_account_ressource.go
+|   |   |-- rustfs_user_resource.go
+|   |   |-- *_test.go
+|   |-- pkg/rustfs/
+|   |   |-- admin_client.go
+|   |   |-- bucket.go
+|   |   |-- policy.go
+|   |   |-- quota.go
+|   |   |-- service_account.go
+|   |   |-- user_account.go
+|   |   |-- *_test.go
+|   |-- docs/
+|   |   |-- index.md
+|   |   |-- resources/
+|   |-- examples/
+|-- virtualizor/                   Virtualizor provider
+|-- vmware/                        VMware vSphere provider
 ```
 
-### Onidel Cloud Provider — Resources
+### Onidel Cloud -- Resources (10)
 
-| Resource | Endpoint | Description |
-|----------|----------|-------------|
-| `onidelcloud_ssh_key` | `POST/GET/DELETE /ssh_keys` | SSH public key management |
-| `onidelcloud_vpc` | `POST/GET/PUT/DELETE /network/vpcs` | Virtual Private Cloud |
-| `onidelcloud_firewall_group` | `POST/GET/PUT/DELETE /network/firewalls` | Firewall group |
-| `onidelcloud_firewall_rule` | `POST/GET/PUT/DELETE /network/firewalls/*/rules` | Firewall rule in a group |
-| `onidelcloud_vm` | `POST/GET/PATCH/DELETE /vm` | Virtual Machine |
-| `onidelcloud_vm_action` | `POST /vm/*/{stop,reboot,snapshot,enable-bgp,disable-bgp,vnc}` | One-shot VM action |
-| `onidelcloud_object_storage` | `POST/GET/DELETE /object-storage` | Object Storage service |
-| `onidelcloud_ip_list` | `POST/GET/PUT/DELETE /network/ip_lists` | IP allowlist/blocklist |
-| `onidelcloud_reserved_ip` | `POST/GET/PATCH/DELETE /network/reserved_ips` | Reserved IP address |
-| `onidelcloud_startup_script` | `POST/GET/PUT/DELETE /startup_scripts` | Startup script |
+| Resource | API Endpoint | Description |
+|----------|-------------|-------------|
+| `onidelcloud_ssh_key` | `POST /ssh_keys`, `GET /ssh_keys/{id}`, `DELETE /ssh_keys/{id}` | Manage SSH public keys for VM access. Create, read, delete keys. Supports multiple keys per VM |
+| `onidelcloud_vpc` | `POST /network/vpcs`, `GET /network/vpcs/{id}`, `PUT /network/vpcs/{id}`, `DELETE /network/vpcs/{id}` | Virtual Private Cloud. Create private networks with IPv4 subnet, attach to VMs for private inter-instance networking |
+| `onidelcloud_firewall_group` | `POST /network/firewalls`, `GET /network/firewalls/{id}`, `PUT /network/firewalls/{id}`, `DELETE /network/firewalls/{id}` | Firewall group as a container for firewall rules. Can be attached to one or more VMs |
+| `onidelcloud_firewall_rule` | `POST /network/firewalls/{group_id}/rules`, `GET /network/firewalls/{group_id}/rules/{id}`, `PUT ...`, `DELETE ...` | Firewall rule within a group. Supports TCP/UDP/ICMP protocols, port ranges, subnet CIDR, IP list references |
+| `onidelcloud_vm` | `POST /vm`, `GET /vm/{id}`, `PATCH /vm/{id}`, `DELETE /vm/{id}` | Virtual Machine. Provision VMs with OS template selection, instance type, location, SSH keys, VPC, firewall, startup script, IPv6 support |
+| `onidelcloud_vm_action` | `POST /vm/{id}/{action}` | One-shot VM actions: stop, reboot, snapshot, enable-bgp, disable-bgp, vnc. Triggers again when input changes |
+| `onidelcloud_object_storage` | `POST /object-storage`, `GET /object-storage/{id}`, `DELETE /object-storage/{id}` | S3-compatible Object Storage service. Create service with optional initial bucket. Manage storage capacity |
+| `onidelcloud_ip_list` | `POST /network/ip_lists`, `GET /network/ip_lists/{id}`, `PUT /network/ip_lists/{id}`, `DELETE /network/ip_lists/{id}` | IP allowlist/blocklist for firewall. Entries auto-detect IPv4/IPv6 type. Referenceable from firewall rules |
+| `onidelcloud_reserved_ip` | `POST /network/reserved_ips`, `GET /network/reserved_ips/{id}`, `PATCH /network/reserved_ips/{id}`, `DELETE ...` | Reserved IP address attachable/detachable to VMs. Supports attach/detach without destroying the resource |
+| `onidelcloud_startup_script` | `POST /startup_scripts`, `GET /startup_scripts/{id}`, `PUT /startup_scripts/{id}`, `DELETE /startup_scripts/{id}` | Startup scripts for VM first-boot customization. Supports bash scripts, max 10 scripts per team |
 
-### Onidel Cloud Provider — Data Sources
+### Onidel Cloud -- Data Sources (13)
 
-| Data Source | Endpoint | Description |
-|-------------|----------|-------------|
-| `onidelcloud_os_template` | `GET /os_templates` | Available OS images |
-| `onidelcloud_instance_type` | `GET /instance_types` | Available VM instance types |
-| `onidelcloud_instance_price` | `GET /instance_price` | VM price calculator |
-| `onidelcloud_teams` | `GET /teams` | Team list |
-| `onidelcloud_ssh_keys` | `GET /ssh_keys` | SSH keys list |
-| `onidelcloud_vpcs` | `GET /network/vpcs` | VPCs list |
-| `onidelcloud_firewall_groups` | `GET /network/firewalls` | Firewall groups list |
-| `onidelcloud_ip_lists` | `GET /network/ip_lists` | IP lists list |
-| `onidelcloud_vms` | `GET /vm` | VMs list |
-| `onidelcloud_object_storage_services` | `GET /object-storage` | Object storage services list |
-| `onidelcloud_startup_scripts` | `GET /startup_scripts` | Startup scripts list |
-| `onidelcloud_snapshots` | `GET /snapshots` | Snapshots list |
-| `onidelcloud_backups` | `GET /backups` | Backups list |
+| Data Source | API Endpoint | Description |
+|-------------|-------------|-------------|
+| `onidelcloud_os_template` | `GET /os_templates` | Available OS templates: Ubuntu, Debian, CentOS, Windows, etc. Each template has an integer ID and family name |
+| `onidelcloud_instance_type` | `GET /instance_types` | Available VM types: VHP, VHP Pro, etc. Each has max vCPU, RAM, disk, network rate, and available locations |
+| `onidelcloud_instance_price` | `GET /instance_price` | VM price calculator. Input: vCPU, RAM, disk, location, instance type. Output: monthly, quarterly, semiannual, annual pricing |
+| `onidelcloud_teams` | `GET /teams` | Team list within an account. Each team has an ID, name, and role (Owner/Admin/Member/Biller) |
+| `onidelcloud_ssh_keys` | `GET /ssh_keys` | List of registered SSH public keys. Optional team_id filter |
+| `onidelcloud_vpcs` | `GET /network/vpcs` | List of VPCs. Filter by team_id and/or location. Shows subnet, status, creation date |
+| `onidelcloud_firewall_groups` | `GET /network/firewalls` | List of firewall groups. Shows description, rule count, attached instance count |
+| `onidelcloud_ip_lists` | `GET /network/ip_lists` | List of IP lists. Also shows team limits for total lists and entries per list |
+| `onidelcloud_vms` | `GET /vm` | List of VMs. Shows: name, vCPU, RAM, disk, IP addresses, status, billing info, attached firewall |
+| `onidelcloud_object_storage_services` | `GET /object-storage` | List of object storage services. Shows: location, region, endpoint, capacity, status |
+| `onidelcloud_startup_scripts` | `GET /startup_scripts` | List of startup scripts. Shows: name, creation date, last update date |
+| `onidelcloud_snapshots` | `GET /snapshots` | List of VM snapshots. Shows: name, description, size, status (available/pending) |
+| `onidelcloud_backups` | `GET /backups` | List of VM backups. Shows: source instance, size, status (available/pending), creation date |
 
 ## Getting Started
 
@@ -100,14 +130,26 @@ terraform-providers/
 - [Go](https://go.dev/) 1.23+
 - [Terraform](https://www.terraform.io/) 1.5+
 
-### Build a provider
+### Build a Provider
 
 ```bash
 cd <provider>
 make build
 ```
 
-### Use a provider locally
+### Use a Provider Locally
+
+Configure `~/.terraformrc` for dev override:
+
+```hcl
+provider_installation {
+  dev_overrides {
+    "tegar/onidelcloud" = "D:/path/to/terraform-providers/onidelcloud"
+  }
+}
+```
+
+Example usage:
 
 ```hcl
 terraform {
@@ -122,12 +164,31 @@ terraform {
 provider "onidelcloud" {
   api_key = var.onidel_api_key
 }
+
+data "onidelcloud_os_template" "ubuntu" {
+  # fetch latest template
+}
+
+resource "onidelcloud_vm" "web" {
+  name          = "web-server-01"
+  instance_type = data.onidelcloud_instance_type.standard.id
+  location      = "Sydney"
+  os            = data.onidelcloud_os_template.ubuntu.templates[0].id
+}
+```
+
+### Acceptance Test
+
+```bash
+cd onidelcloud
+export ONIDEL_API_KEY="your-api-key"
+TF_ACC=1 go test ./... -v -run TestAcc
 ```
 
 ## License
 
-Each provider may have its own license terms. Refer to individual `LICENSE` files within each provider directory.
+Each provider may have its own license terms. Refer to individual LICENSE files within each provider directory.
 
 ## Author
 
-**Tegar** — Infrastructure automation
+**Tegar** -- Infrastructure automation
