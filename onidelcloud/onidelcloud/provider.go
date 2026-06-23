@@ -5,6 +5,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/tegar/Terraform/onidelcloud/onidelcloud/backup"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/config"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/firewall"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/instancetype"
@@ -12,6 +13,7 @@ import (
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/objectstorage"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/ostemplate"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/reservedip"
+	"github.com/tegar/Terraform/onidelcloud/onidelcloud/snapshot"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/sshkey"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/startupscript"
 	"github.com/tegar/Terraform/onidelcloud/onidelcloud/teams"
@@ -46,13 +48,22 @@ func Provider() *schema.Provider {
 			"onidelcloud_ip_list":        iplist.ResourceOnidelCloudIPList(),
 			"onidelcloud_reserved_ip":    reservedip.ResourceOnidelCloudReservedIP(),
 			"onidelcloud_startup_script": startupscript.ResourceOnidelCloudStartupScript(),
+			"onidelcloud_vm_action":     vm.ResourceOnidelCloudVMAction(),
 		},
 		DataSourcesMap: map[string]*schema.Resource{
-			"onidelcloud_os_template":   ostemplate.DataSourceOnidelCloudOSTemplate(),
-			"onidelcloud_instance_type": instancetype.DataSourceOnidelCloudInstanceType(),
-			"onidelcloud_teams":         teams.DataSourceOnidelCloudTeams(),
-			"onidelcloud_ssh_keys":      sshkey.DataSourceOnidelCloudSSHKeys(),
-			"onidelcloud_vpcs":          vpc.DataSourceOnidelCloudVPCs(),
+			"onidelcloud_os_template":              ostemplate.DataSourceOnidelCloudOSTemplate(),
+			"onidelcloud_instance_type":            instancetype.DataSourceOnidelCloudInstanceType(),
+			"onidelcloud_instance_price":           instancetype.DataSourceOnidelCloudInstancePrice(),
+			"onidelcloud_teams":                    teams.DataSourceOnidelCloudTeams(),
+			"onidelcloud_ssh_keys":                 sshkey.DataSourceOnidelCloudSSHKeys(),
+			"onidelcloud_vpcs":                     vpc.DataSourceOnidelCloudVPCs(),
+			"onidelcloud_firewall_groups":          firewall.DataSourceOnidelCloudFirewallGroups(),
+			"onidelcloud_ip_lists":                 iplist.DataSourceOnidelCloudIPLists(),
+			"onidelcloud_vms":                      vm.DataSourceOnidelCloudVMs(),
+			"onidelcloud_object_storage_services":  objectstorage.DataSourceOnidelCloudObjectStorageServices(),
+			"onidelcloud_startup_scripts":           startupscript.DataSourceOnidelCloudStartupScripts(),
+			"onidelcloud_snapshots":                snapshot.DataSourceOnidelCloudSnapshots(),
+			"onidelcloud_backups":                  backup.DataSourceOnidelCloudBackups(),
 		},
 		ConfigureContextFunc: providerConfigure,
 	}
