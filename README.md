@@ -12,7 +12,7 @@ Monorepo for custom Terraform providers managed by [@tegar](https://github.com/t
 | [`ionoscloud`](./ionoscloud) | Fork | Fork of official `terraform-provider-ionoscloud` |
 | [`Juniper`](./Juniper) | Internal | Juniper network device provider |
 | [`mikrotik`](./mikrotik) | Internal | MikroTik RouterOS provider |
-| [`onidelcloud`](./onidelcloud) | **Active** | Onidel Cloud API provider (SSH Key, VPC, Firewall, VM, Object Storage, Reserved IP, IP List, Startup Script) |
+| [`onidelcloud`](./onidelcloud) | **Active** | Onidel Cloud API provider — 10 resources + 13 data sources |
 | [`openstack`](./openstack) | Fork | Fork of official `terraform-provider-openstack` |
 | [`proxmox`](./proxmox) | Fork | Fork / custom Proxmox VE provider |
 | [`virtualizor`](./virtualizor) | Internal | Virtualizor VPS provider |
@@ -30,31 +30,67 @@ terraform-providers/
 ├── Juniper/               # Juniper provider
 ├── mikrotik/              # MikroTik provider
 ├── onidelcloud/           # Onidel Cloud provider
+│   ├── main.go
+│   ├── go.mod / go.sum
+│   ├── GNUmakefile
+│   ├── scripts/
+│   └── onidelcloud/
+│       ├── provider.go
+│       ├── provider_test.go
+│       ├── config/config.go
+│       ├── sshkey/           # resource + data source
+│       ├── vpc/              # resource + data source
+│       ├── firewall/         # 2 resource + data source
+│       ├── vm/               # resource + data source + action
+│       ├── objectstorage/    # resource + data source
+│       ├── iplist/           # resource + data source
+│       ├── reservedip/       # resource
+│       ├── startupscript/    # resource + data source
+│       ├── ostemplate/       # data source
+│       ├── instancetype/     # data source + price
+│       ├── teams/            # data source
+│       ├── snapshot/         # data source
+│       └── backup/           # data source
 ├── openstack/             # OpenStack provider
 ├── proxmox/               # Proxmox provider
 ├── virtualizor/           # Virtualizor provider
 └── vmware/                # VMware vSphere provider
 ```
 
-Each provider follows standard Terraform provider conventions:
+### Onidel Cloud Provider
 
-```
-<provider>/
-├── main.go                # Entry point
-├── go.mod / go.sum        # Go module definition
-├── GNUmakefile            # Build automation
-├── scripts/               # Helper scripts
-├── docs/                  # Documentation
-├── examples/              # Usage examples
-├── .github/               # GitHub workflows
-│   └── workflows/
-├── <provider>/            # Provider package
-│   ├── provider.go        # Provider definition
-│   ├── config/            # API client config
-│   └── <resource>/        # Resource implementations
-│       ├── resource_*.go
-│       └── data_source_*.go
-```
+**Resources (10):**
+
+| Resource | Endpoint | Description |
+|----------|----------|-------------|
+| `onidelcloud_ssh_key` | `POST/GET/DELETE /ssh_keys` | SSH public key management |
+| `onidelcloud_vpc` | `POST/GET/PUT/DELETE /network/vpcs` | Virtual Private Cloud |
+| `onidelcloud_firewall_group` | `POST/GET/PUT/DELETE /network/firewalls` | Firewall group |
+| `onidelcloud_firewall_rule` | `POST/GET/PUT/DELETE /network/firewalls/*/rules` | Firewall rule in a group |
+| `onidelcloud_vm` | `POST/GET/PATCH/DELETE /vm` | Virtual Machine |
+| `onidelcloud_vm_action` | `POST /vm/*/{stop,reboot,snapshot,enable-bgp,disable-bgp,vnc}` | One-shot VM action |
+| `onidelcloud_object_storage` | `POST/GET/DELETE /object-storage` | Object Storage service |
+| `onidelcloud_ip_list` | `POST/GET/PUT/DELETE /network/ip_lists` | IP allowlist/blocklist |
+| `onidelcloud_reserved_ip` | `POST/GET/PATCH/DELETE /network/reserved_ips` | Reserved IP address |
+| `onidelcloud_startup_script` | `POST/GET/PUT/DELETE /startup_scripts` | Startup script |
+
+**Data Sources (13):**
+
+| Data Source | Endpoint | Description |
+|-------------|----------|-------------|
+| `onidelcloud_os_template` | `GET /os_templates` | Available OS images |
+| `onidelcloud_instance_type` | `GET /instance_types` | Available VM instance types |
+| `onidelcloud_instance_price` | `GET /instance_price` | VM price calculator |
+| `onidelcloud_teams` | `GET /teams` | Team list |
+| `onidelcloud_ssh_keys` | `GET /ssh_keys` | SSH keys list |
+| `onidelcloud_vpcs` | `GET /network/vpcs` | VPCs list |
+| `onidelcloud_firewall_groups` | `GET /network/firewalls` | Firewall groups list |
+| `onidelcloud_ip_lists` | `GET /network/ip_lists` | IP lists list |
+| `onidelcloud_vms` | `GET /vm` | VMs list |
+| `onidelcloud_object_storage_services` | `GET /object-storage` | Object storage services list |
+| `onidelcloud_startup_scripts` | `GET /startup_scripts` | Startup scripts list |
+| `onidelcloud_snapshots` | `GET /snapshots` | Snapshots list |
+| `onidelcloud_backups` | `GET /backups` | Backups list |
 
 ## Getting Started
 
